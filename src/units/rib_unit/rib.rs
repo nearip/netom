@@ -48,7 +48,10 @@ use crate::{
         RotondaRoute, RouterId,
     },
     representation::{GenOutput, Json},
-    roto_runtime::{types::RotoPackage, Ctx},
+    roto_runtime::{
+        types::{PeerRibType, RotoPackage},
+        Ctx,
+    },
 };
 
 use super::flowspec::{
@@ -1462,10 +1465,20 @@ impl Rib {
             .unwrap_or_else(|p| p.into_inner())
             .entry(child)
             .or_insert(0) += 1;
-        self.retired_empty_children
+        let was_retired = self
+            .retired_empty_children
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&child);
+        // A child this RIB retired as empty owns a record again: it is
+        // connected again, by the same hand that disconnected it. The BMP
+        // unit's own refresh of the child (on exploding the announcement)
+        // may have run before the retirement, in which case nothing else
+        // would ever flip it back, and the GC reclaims a Disconnected child
+        // with its records (`remove_for_ingresses`): a live route lost.
+        if was_retired {
+            self.ingress_register.reconnect_path_child(child);
+        }
     }
 
     fn path_child_record_removed(&self, child: IngressId) {
@@ -2675,7 +2688,7 @@ impl Rib {
             records.retain(|r| {
                 ingress_info
                     .get(&r.multi_uniq_id)
-                    .map(|ii| ii.peer_rib_type == Some(rib_type))
+                    .map(|ii| rib_type_matches(rib_type, ii, ingress_info))
                     .unwrap_or(true)
             });
         }
@@ -3288,6 +3301,27 @@ pub(crate) fn ingress_type_matches(
         (want, Some(session_type)) => want == session_type,
         (_, None) => false,
     }
+}
+
+/// Whether the record's ingress serves the monitored RIB `want`, for
+/// `filter[ribType]`.
+///
+/// As for `filter[ingressType]`, an ADD-PATH path-child resolves to its
+/// session: the RIB a route was learned from is a property of the monitored
+/// session, and a child carries no `peer_rib_type` of its own. Comparing the
+/// child's own field dropped every ADD-PATH record of a Loc-RIB session, so
+/// `ribType=loc` answered with the few non-ADD-PATH records only.
+pub(crate) fn rib_type_matches(
+    want: PeerRibType,
+    info: &IngressInfo,
+    all: &HashMap<IngressId, IngressInfo>,
+) -> bool {
+    let session = if info.ingress_type == Some(IngressType::BgpPath) {
+        info.parent_ingress.and_then(|parent| all.get(&parent))
+    } else {
+        Some(info)
+    };
+    session.is_some_and(|session| session.peer_rib_type == Some(want))
 }
 
 crate::genoutput_json!(SearchResult);
@@ -4911,5 +4945,390 @@ mod tests {
         rib.recount_flowspec_rules();
         assert_eq!(flowspec_rows(&rib).len(), 1);
         assert_eq!(rib.flowspec_rule_counts.snapshot(), (1, 0));
+    }
+
+    // --- ADD-PATH path-children: the store against a reference model ------
+
+    /// The per-peer `path_id -> child` cache the BMP state machine keeps
+    /// (`PeerState::path_children`), with its lookup rules: a cached child is
+    /// refreshed through the register before it is reused and a fresh one is
+    /// minted when the refresh fails (`get_or_create_path_child`); a
+    /// withdrawal only looks the cache up and never mints (`get_path_child`).
+    struct SessionSide {
+        session: IngressId,
+        children: HashMap<u32, IngressId>,
+    }
+
+    impl SessionSide {
+        fn new(reg: &ingress::Register) -> Self {
+            use crate::ingress::register::IngressState;
+            let session = reg.register();
+            reg.update_info(
+                session,
+                IngressInfo::new()
+                    .with_ingress_type(IngressType::BgpViaBmp)
+                    .with_state(IngressState::Connected),
+            );
+            Self {
+                session,
+                children: HashMap::new(),
+            }
+        }
+
+        fn announce_child(
+            &mut self,
+            reg: &ingress::Register,
+            path_id: u32,
+        ) -> IngressId {
+            use crate::ingress::register::IngressState;
+            if let Some(&id) = self.children.get(&path_id) {
+                if reg.refresh_path_child(id, self.session, path_id) {
+                    return id;
+                }
+                self.children.remove(&path_id);
+            }
+            let id = reg.register();
+            reg.update_info(
+                id,
+                IngressInfo::new()
+                    .with_ingress_type(IngressType::BgpPath)
+                    .with_parent_ingress(self.session)
+                    .with_path_id(path_id)
+                    .with_state(IngressState::Connected),
+            );
+            self.children.insert(path_id, id);
+            id
+        }
+
+        fn withdraw_child(&self, path_id: u32) -> Option<IngressId> {
+            self.children.get(&path_id).copied()
+        }
+    }
+
+    fn v4_route(prefix: &str) -> RotondaRoute {
+        RotondaRoute::Ipv4Unicast(
+            prefix.parse::<Prefix>().unwrap().try_into().unwrap(),
+            RotondaPaMap::empty_path_attributes(),
+        )
+    }
+
+    /// Every `(prefix, mui)` the unicast store holds, withdrawn records and
+    /// records of globally withdrawn muis included: what a reclaim walk
+    /// would see, not what a query shows.
+    fn stored_records(rib: &Rib) -> HashSet<(Prefix, IngressId)> {
+        let guard = &epoch::pin();
+        rib.store()
+            .unwrap()
+            .prefixes_iter(guard)
+            .flatten()
+            .flat_map(|pr| {
+                pr.meta
+                    .into_iter()
+                    .map(move |r| (pr.prefix, r.multi_uniq_id))
+            })
+            .collect()
+    }
+
+    /// Every live `(prefix, mui)`: what `/routes` answers.
+    fn live_records(rib: &Rib) -> HashSet<(Prefix, IngressId)> {
+        rib.iter_all_prefix_records()
+            .unwrap()
+            .into_iter()
+            .flat_map(|pr| {
+                pr.meta
+                    .into_iter()
+                    .map(move |r| (pr.prefix, r.multi_uniq_id))
+            })
+            .collect()
+    }
+
+    fn insert_v4(
+        rib: &Rib,
+        prefix: &str,
+        status: RouteStatus,
+        mui: IngressId,
+    ) {
+        rib.insert(&v4_route(prefix), status, 0, mui, false, false)
+            .unwrap();
+    }
+
+    fn gc_twice(rib: &Rib) {
+        let prev = rib.gc_disconnected_bmp_peers(HashSet::new());
+        rib.gc_disconnected_bmp_peers(prev);
+    }
+
+    #[derive(Clone, Copy)]
+    enum Op {
+        /// An announcement of (prefix, path id), exploded and inserted.
+        A(&'static str, u32),
+        /// A withdrawal of (prefix, path id), exploded and inserted.
+        W(&'static str, u32),
+        /// Two GC sweeps: anything Disconnected at the first is reclaimed
+        /// by the second.
+        Gc,
+    }
+
+    /// Feed a Loc-RIB ADD-PATH sequence in order (the BMP unit explodes an
+    /// UPDATE and the RIB unit inserts it before the next one is exploded)
+    /// and compare the store, after every step, with the set of live
+    /// (prefix, path id) pairs the sequence implies. Path id numbers are
+    /// reused across prefixes (RFC 7911: a path id is scoped per prefix),
+    /// paths are re-announced under the same and under new ids, withdrawals
+    /// are partial, some hit a path that was never announced, and children
+    /// are retired, reclaimed, re-minted and reactivated along the way.
+    #[test]
+    fn path_children_store_matches_the_reference_model_in_order() {
+        use Op::*;
+        let rib = test_rib();
+        let reg = &rib.ingress_register;
+        let mut side = SessionSide::new(reg);
+        // (prefix, path id) -> the child that holds it.
+        let mut model: HashMap<(Prefix, u32), IngressId> = HashMap::new();
+
+        let ops = [
+            // An ECMP pair from two route reflectors, the same two ids on
+            // every prefix of the pair.
+            A("193.46.219.0/24", 1),
+            A("193.46.219.0/24", 2),
+            A("193.37.64.0/24", 1),
+            A("193.37.64.0/24", 2),
+            A("194.35.42.0/24", 1),
+            A("194.35.42.0/24", 2),
+            // A single-path prefix under id 1 as well.
+            A("5.42.160.0/22", 1),
+            // Re-announcement of a path the store holds: no new record.
+            A("193.46.219.0/24", 1),
+            // A withdrawal for a path never announced under that id, and
+            // one for an id this session never used.
+            W("202.45.88.0/24", 1),
+            W("193.46.219.0/24", 9),
+            // A partial withdrawal: id 1 keeps its other prefixes.
+            W("5.42.160.0/22", 1),
+            // The path comes back under a new id, which then also carries
+            // another prefix.
+            A("5.42.160.0/22", 7),
+            A("202.45.88.0/24", 7),
+            // The second reflector's paths go: id 2 empties and retires.
+            W("193.46.219.0/24", 2),
+            W("193.37.64.0/24", 2),
+            W("194.35.42.0/24", 2),
+            Gc,
+            // Id 2 is used again after its child was reclaimed: a fresh
+            // child.
+            A("193.46.219.0/24", 2),
+            A("193.37.64.0/24", 2),
+            // Id 7 empties and retires, then is announced again before the
+            // GC runs: the retired child is reactivated and the sweep must
+            // leave it alone.
+            W("202.45.88.0/24", 7),
+            W("5.42.160.0/22", 7),
+            A("5.42.160.0/22", 7),
+            Gc,
+            // The whole pair for one prefix, then back under the same ids.
+            W("194.35.42.0/24", 1),
+            A("194.35.42.0/24", 1),
+            A("194.35.42.0/24", 2),
+            Gc,
+        ];
+
+        for (step, op) in ops.iter().enumerate() {
+            match *op {
+                A(p, pid) => {
+                    let prefix: Prefix = p.parse().unwrap();
+                    let child = side.announce_child(reg, pid);
+                    rib.insert(
+                        &v4_route(p),
+                        RouteStatus::Active,
+                        0,
+                        child,
+                        false,
+                        false,
+                    )
+                    .unwrap();
+                    model.insert((prefix, pid), child);
+                }
+                W(p, pid) => {
+                    let prefix: Prefix = p.parse().unwrap();
+                    if let Some(child) = side.withdraw_child(pid) {
+                        rib.insert(
+                            &v4_route(p),
+                            RouteStatus::Withdrawn,
+                            0,
+                            child,
+                            false,
+                            false,
+                        )
+                        .unwrap();
+                    }
+                    model.remove(&(prefix, pid));
+                }
+                Gc => gc_twice(&rib),
+            }
+            let expected: HashSet<(Prefix, IngressId)> = model
+                .iter()
+                .map(|((prefix, _), child)| (*prefix, *child))
+                .collect();
+            assert_eq!(
+                live_records(&rib),
+                expected,
+                "live records after step {step} ({})",
+                match *op {
+                    A(p, pid) => format!("announce {p} path id {pid}"),
+                    W(p, pid) => format!("withdraw {p} path id {pid}"),
+                    Gc => "gc".to_string(),
+                }
+            );
+            assert_eq!(
+                stored_records(&rib),
+                expected,
+                "stored records after step {step}"
+            );
+            // Every child the model references is registered and owns
+            // exactly the records the model gives it; the counts never
+            // drift from the store.
+            let mut owned: HashMap<IngressId, u32> = HashMap::new();
+            for child in model.values() {
+                *owned.entry(*child).or_insert(0) += 1;
+            }
+            for (child, n) in &owned {
+                assert!(
+                    reg.get(*child).is_some(),
+                    "child {child} owns {n} records but left the register \
+                     after step {step}"
+                );
+                assert_eq!(
+                    rib.path_child_record_count(*child),
+                    *n,
+                    "record count of child {child} after step {step}"
+                );
+            }
+        }
+    }
+
+    /// The RIB unit runs behind the BMP unit: an UPDATE is exploded (and its
+    /// cached path-child refreshed through the register) before the RIB has
+    /// inserted the previous one. A withdrawal that empties a child followed
+    /// by an announcement under the same path id, exploded back to back,
+    /// then reaches the RIB in order: the withdrawal retires the child, the
+    /// announcement adds a record to it, and nothing sets the child
+    /// Connected again. The GC reclaims a Disconnected child two sweeps
+    /// later and removes the record it still owns: a live Loc-RIB route is
+    /// gone.
+    #[test]
+    fn retired_child_reannounced_before_the_rib_caught_up_survives_the_gc() {
+        use crate::ingress::register::IngressState;
+        let rib = test_rib();
+        let reg = &rib.ingress_register;
+        let mut side = SessionSide::new(reg);
+
+        let prefixes =
+            ["193.46.219.0/24", "193.37.64.0/24", "194.35.42.0/24"];
+        let child = side.announce_child(reg, 5);
+        for p in prefixes {
+            insert_v4(&rib, p, RouteStatus::Active, child);
+        }
+        assert_eq!(rib.path_child_record_count(child), 3);
+
+        // bmp-in explodes the withdrawals and then the re-announcements
+        // (the same path id: the paths did not change) while the RIB unit
+        // has inserted none of them yet.
+        for _ in prefixes {
+            assert_eq!(side.withdraw_child(5), Some(child));
+        }
+        for _ in prefixes {
+            assert_eq!(side.announce_child(reg, 5), child);
+        }
+
+        // The RIB unit now inserts them, in order.
+        for p in prefixes {
+            insert_v4(&rib, p, RouteStatus::Withdrawn, child);
+        }
+        assert_eq!(rib.path_child_record_count(child), 0);
+        for p in prefixes {
+            insert_v4(&rib, p, RouteStatus::Active, child);
+        }
+        assert_eq!(rib.path_child_record_count(child), 3);
+
+        let expected: HashSet<(Prefix, IngressId)> = prefixes
+            .iter()
+            .map(|p| (p.parse().unwrap(), child))
+            .collect();
+        assert_eq!(live_records(&rib), expected);
+
+        gc_twice(&rib);
+        assert_eq!(
+            live_records(&rib),
+            expected,
+            "the GC removed live Loc-RIB records"
+        );
+        assert!(
+            reg.get(child).is_some(),
+            "the GC reclaimed a child that owns 3 live records"
+        );
+        // A child that owns records is a connected child, whatever order
+        // the two units observed the sequence in.
+        assert_eq!(
+            reg.get(child).map(|i| i.state),
+            Some(Some(IngressState::Connected)),
+            "a child owning 3 records is Disconnected: the GC will reclaim it"
+        );
+    }
+
+    /// `filter[ribType]` resolves a path-child to its session, as
+    /// `filter[ingressType]` does: the child has no `peer_rib_type` of its
+    /// own, and every ADD-PATH record of a Loc-RIB session was dropped.
+    #[test]
+    fn rib_type_filter_matches_the_session_of_a_path_child() {
+        let loc = IngressInfo {
+            peer_rib_type: Some(PeerRibType::Loc),
+            ..info(IngressType::BgpViaBmp, None)
+        };
+        let adj_in = IngressInfo {
+            peer_rib_type: Some(PeerRibType::InPre),
+            ..info(IngressType::BgpViaBmp, None)
+        };
+        let loc_child = info(IngressType::BgpPath, Some(1));
+        let adj_in_child = info(IngressType::BgpPath, Some(2));
+        let all = HashMap::from([
+            (1, loc.clone()),
+            (2, adj_in.clone()),
+            (3, loc_child.clone()),
+            (4, adj_in_child.clone()),
+        ]);
+
+        assert!(rib_type_matches(PeerRibType::Loc, &loc, &all));
+        assert!(rib_type_matches(PeerRibType::Loc, &loc_child, &all));
+        assert!(!rib_type_matches(PeerRibType::Loc, &adj_in, &all));
+        assert!(!rib_type_matches(PeerRibType::Loc, &adj_in_child, &all));
+        assert!(rib_type_matches(PeerRibType::InPre, &adj_in_child, &all));
+
+        // A child whose session is gone serves no RIB.
+        let orphan = info(IngressType::BgpPath, Some(99));
+        assert!(!rib_type_matches(PeerRibType::Loc, &orphan, &all));
+
+        // Through the query filter itself: a Loc-RIB session's ADD-PATH
+        // records stay in, an Adj-RIB-In session's go.
+        let rib = test_rib();
+        let record = |mui: IngressId| {
+            Record::new(
+                mui,
+                0,
+                RouteStatus::Active,
+                RotondaPaMap::empty_path_attributes(),
+            )
+        };
+        let mut records = vec![record(3), record(4), record(1)];
+        rib.apply_filter(
+            &mut records,
+            &QueryFilter {
+                rib_type: Some(PeerRibType::Loc),
+                ..Default::default()
+            },
+            None,
+            &all,
+        );
+        let muis: Vec<IngressId> =
+            records.iter().map(|r| r.multi_uniq_id).collect();
+        assert_eq!(muis, vec![3, 1]);
     }
 }

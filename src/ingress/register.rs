@@ -682,6 +682,33 @@ impl Register {
         true
     }
 
+    /// Undo `retire_empty_path_child` for a child that owns a record again:
+    /// it goes back to `Connected` so the GC leaves it alone. Returns
+    /// whether it did; `false` when the child is already connected or no
+    /// longer registered.
+    ///
+    /// The RIB unit runs behind the BMP unit, which refreshes a cached
+    /// child when it explodes an announcement (`refresh_path_child`). When
+    /// a withdrawal that empties the child and an announcement under the
+    /// same path id are exploded back to back, that refresh lands before
+    /// the RIB retires the child, and only the RIB, when it then adds the
+    /// record, knows the child is live again.
+    pub fn reconnect_path_child(&self, id: IngressId) -> bool {
+        let mut lock = self.info.write().unwrap();
+        let Some(info) = lock.get_mut(&id) else {
+            return false;
+        };
+        if info.ingress_type != Some(IngressType::BgpPath)
+            || info.state != Some(IngressState::Disconnected)
+        {
+            return false;
+        }
+        info.state = Some(IngressState::Connected);
+        info.history_generation = info.history_generation.saturating_add(1);
+        info.history_revision = info.history_revision.saturating_add(1);
+        true
+    }
+
     /// Validate a cached path-child and reactivate it atomically with GC.
     /// Recording activity also invalidates any in-progress idle scan.
     pub fn refresh_path_child(
