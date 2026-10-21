@@ -43,6 +43,7 @@ struct Metrics {
     disk_bytes: AtomicU64,
     queue_bytes: AtomicU64,
     healthy: AtomicU64,
+    dropped: AtomicU64,
 }
 impl crate::metrics::Source for Metrics {
     fn append(&self, name: &str, target: &mut crate::metrics::Target) {
@@ -95,6 +96,12 @@ impl crate::metrics::Source for Metrics {
                 "Accounted bytes waiting for the spool writer",
                 &self.queue_bytes,
                 true,
+            ),
+            (
+                "clickhouse_dropped",
+                "Observations dropped because the spool was full (drop_when_spool_full)",
+                &self.dropped,
+                false,
             ),
             (
                 "clickhouse_healthy",
@@ -402,6 +409,24 @@ fn writer(
             if let Some(s) = segment.take() {
                 s.seal()?;
                 seen.clear();
+            }
+            if config.drop_when_spool_full && shutdown.is_none() {
+                // Keep the sources moving: what the spool cannot hold is
+                // dropped and counted, never waited for.
+                let mut dropped = u64::from(pending_event.take().is_some())
+                    + u64::from(current.take().is_some());
+                let until = Instant::now() + Duration::from_millis(250);
+                while let Some(left) = until.checked_duration_since(Instant::now()) {
+                    match rx.recv_timeout(left) {
+                        Ok(_) => dropped += 1,
+                        Err(_) => break,
+                    }
+                }
+                if dropped > 0 {
+                    metrics.dropped.fetch_add(dropped, Relaxed);
+                    log::warn!("clickhouse-out spool full; dropped {dropped} observations");
+                }
+                continue;
             }
             std::thread::sleep(Duration::from_millis(250));
             continue;
@@ -791,6 +816,44 @@ mod tests {
             count >= 13,
             "ten controls, start/end, and repeated segment identities"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_spool_drops_and_counts_when_configured() {
+        let dir = std::env::temp_dir()
+            .join(format!("netom-ch-drop-{}", uuid::Uuid::new_v4()));
+        let spool = Arc::new(Spool::open(&dir, "test").unwrap());
+        let config = Config {
+            spool_dir: dir.clone(),
+            spool_bytes: 1,
+            reserve_bytes: 0,
+            shutdown_seconds: 1,
+            drop_when_spool_full: true,
+            ..Default::default()
+        };
+        let (r, rx) = receiver(Arc::new(Register::new()));
+        for _ in 0..3 {
+            r.send(r.base(1, 4, None)).await;
+        }
+        let metrics = r.metrics.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_writer = stop.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            writer(spool, config, rx, stop_writer, metrics, [2; 16])
+        });
+        // The queued observations are dropped, not waited for: the budget
+        // comes back while the writer is still running.
+        for _ in 0..50 {
+            if r.metrics.dropped.load(Relaxed) >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(r.metrics.dropped.load(Relaxed) >= 3);
+        assert_eq!(r.budget.available_permits(), 2 << 20);
+        stop.store(true, Relaxed);
+        let _ = handle.await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

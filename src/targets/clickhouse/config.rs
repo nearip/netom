@@ -21,6 +21,11 @@ pub struct Config {
     pub retention_hours: u32,
     pub request_timeout_seconds: u64,
     pub shutdown_seconds: u64,
+    /// With the spool full, keep consuming and drop observations (counted
+    /// in `clickhouse_dropped`) instead of stopping admission. Off by
+    /// default: a full spool then back-pressures every source, and a BMP
+    /// source stops reading its sockets until ClickHouse catches up.
+    pub drop_when_spool_full: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -41,6 +46,7 @@ impl Default for Config {
             retention_hours: 24,
             request_timeout_seconds: 60,
             shutdown_seconds: 30,
+            drop_when_spool_full: false,
         }
     }
 }

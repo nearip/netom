@@ -1,3 +1,4 @@
+use roaring::RoaringBitmap;
 use std::{
     collections::{hash_set, HashMap, HashSet},
     fmt,
@@ -62,6 +63,9 @@ enum FlowSpecOriginator {
 }
 
 type Store = StarCastRib<RotondaPaMap, MemoryOnlyConfig>;
+
+/// Prefixes removed per `withdraw_lock` hold when reclaiming ingresses.
+const REMOVE_CHUNK: usize = 16_384;
 
 // ---------------------------------------------------------------------------
 // Streaming full-RIB dump tuning + concurrency control
@@ -1271,45 +1275,31 @@ impl Rib {
             self.compact_withdrawn_attributes_for_ingresses(ids);
         }
 
+        // Every id withdrawn in all families goes into each store's withdrawn
+        // index in one swap: one copy of the bitmap per store instead of one
+        // per id (a peer-down cascade after an ADD-PATH dump withdraws ~1e5
+        // path-children at once).
+        let all_families: RoaringBitmap = ids
+            .iter()
+            .filter(|(_, afisafi)| afisafi.is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        for (name, res) in [
+            ("unicast", (*self.unicast).as_ref().unwrap().mark_muis_as_withdrawn(&all_families)),
+            ("multicast", (*self.multicast).as_ref().unwrap().mark_muis_as_withdrawn(&all_families)),
+            ("flowspec", (*self.flowspec).as_ref().unwrap().mark_muis_as_withdrawn(&all_families)),
+        ] {
+            if let Err(e) = res {
+                error!("failed to mark MUIs as withdrawn in {name} rib: {e}");
+            }
+        }
+
         for (ingress_id, specific_afisafi) in ids {
             debug!("withdraw_for_ingress for {ingress_id}");
             reset_peer_gauge(*ingress_id, *specific_afisafi);
             match specific_afisafi {
-                None => {
-                    // Set all address families to withdrawn.
-                    // `mark_mui_as_withdrawn` already covers both v4 and v6
-                    // in the unicast store in a single tree walk.
-
-                    debug!(
-                        "mark_mui_as_withdrawn on unicast for {ingress_id}"
-                    );
-                    if let Err(e) = (*self.unicast)
-                        .as_ref()
-                        .unwrap()
-                        .mark_mui_as_withdrawn(*ingress_id)
-                    {
-                        error!(
-                            "failed to mark MUI as withdrawn in unicast rib: {}",
-                            e
-                        )
-                    }
-
-                    if let Err(e) = (*self.multicast)
-                        .as_ref()
-                        .unwrap()
-                        .mark_mui_as_withdrawn(*ingress_id)
-                    {
-                        error!("failed to mark MUI as withdrawn in multicast rib: {}", e)
-                    }
-
-                    if let Err(e) = (*self.flowspec)
-                        .as_ref()
-                        .unwrap()
-                        .mark_mui_as_withdrawn(*ingress_id)
-                    {
-                        error!("failed to mark MUI as withdrawn in flowspec rib: {}", e)
-                    }
-                }
+                // Marked above, in one swap per store.
+                None => {}
                 Some(AfiSafiType::Ipv4Unicast) => {
                     if let Err(e) = (*self.unicast)
                         .as_ref()
@@ -1412,54 +1402,70 @@ impl Rib {
             return;
         }
 
-        // `remove_mui` clears the per-store `withdrawn_muis_bmin` bitmap (via
-        // mark_mui_as_active), the same CAS that livelocks under concurrent
-        // writers, so it must hold `withdraw_lock` just like the mark path.
-        // See the `withdraw_lock` field comment.
-        let _guard = self
-            .withdraw_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // One walk per store for the whole batch, and no lock held during
+        // it. `remove_mui` walked every prefix once per id while this held
+        // `withdraw_lock` throughout, and the ingest path takes that lock for
+        // every withdrawal: a sweep retiring K ids cost K full walks with
+        // ingest stopped. After a BMP session drop following an ADD-PATH
+        // dump (~1e5 path-children over ~1e6 prefixes) that stopped ingest
+        // for hours; the exporters saw a zero window, closed the session and
+        // re-dumped, which disconnected more children.
+        //
+        // The walk is read-only. The removals take `withdraw_lock` per chunk
+        // of prefixes, and the muis leave each store's withdrawn index in one
+        // swap: the lock serializes writes to that index (see the field
+        // comment), so it is held for one chunk, never for a walk.
+        let muis: RoaringBitmap = ids.iter().copied().collect();
+        let lock = || {
+            self.withdraw_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
         let count_mutation = self.flowspec_rule_counts.begin_mutation();
 
-        for &id in ids {
-            reset_peer_gauge(id, None);
-            if let Some(store) = (*self.unicast).as_ref() {
-                match store.remove_mui(id) {
-                    Ok((records, emptied)) => debug!(
-                        "removed MUI {id} from unicast rib: \
-                         {records} records, {emptied} prefixes emptied"
-                    ),
-                    Err(e) => error!(
-                        "failed to remove MUI {id} from unicast rib: {e}"
-                    ),
-                }
-            }
-            if let Some(store) = (*self.multicast).as_ref() {
-                match store.remove_mui(id) {
-                    Ok((records, emptied)) => debug!(
-                        "removed MUI {id} from multicast rib: \
-                         {records} records, {emptied} prefixes emptied"
-                    ),
-                    Err(e) => error!(
-                        "failed to remove MUI {id} from multicast rib: {e}"
-                    ),
-                }
-            }
-            if let Some(store) = (*self.flowspec).as_ref() {
-                match store.remove_mui(id) {
-                    Ok((records, emptied)) => debug!(
-                        "removed MUI {id} from flowspec rib: \
-                         {records} records, {emptied} prefixes emptied"
-                    ),
-                    Err(e) => error!(
-                        "failed to remove MUI {id} from flowspec rib: {e}"
-                    ),
-                }
+        if let Some(store) = (*self.unicast).as_ref() {
+            match store.remove_muis(&muis, REMOVE_CHUNK, lock) {
+                Ok((records, emptied)) => debug!(
+                    "removed {} MUIs from unicast rib: {records} records, \
+                     {emptied} prefixes emptied",
+                    muis.len()
+                ),
+                Err(e) => error!(
+                    "failed to remove {} MUIs from unicast rib: {e}",
+                    muis.len()
+                ),
             }
         }
+        if let Some(store) = (*self.multicast).as_ref() {
+            match store.remove_muis(&muis, REMOVE_CHUNK, lock) {
+                Ok((records, emptied)) => debug!(
+                    "removed {} MUIs from multicast rib: {records} records, \
+                     {emptied} prefixes emptied",
+                    muis.len()
+                ),
+                Err(e) => error!(
+                    "failed to remove {} MUIs from multicast rib: {e}",
+                    muis.len()
+                ),
+            }
+        }
+        if let Some(store) = (*self.flowspec).as_ref() {
+            match store.remove_muis(&muis, REMOVE_CHUNK, lock) {
+                Ok((records, emptied)) => debug!(
+                    "removed {} MUIs from flowspec rib: {records} records, \
+                     {emptied} prefixes emptied",
+                    muis.len()
+                ),
+                Err(e) => error!(
+                    "failed to remove {} MUIs from flowspec rib: {e}",
+                    muis.len()
+                ),
+            }
+        }
+        for &id in ids {
+            reset_peer_gauge(id, None);
+        }
         drop(count_mutation);
-        drop(_guard);
         self.recount_flowspec_rules();
     }
 

@@ -543,6 +543,17 @@ impl RibUnitRunner {
     /// running it inline on a tokio worker can stall the pipeline while
     /// waiting for the lock and/or while doing the bitmap walk itself.
     async fn reset_ingress_blocking(&self, ingress_id: ingress::IngressId) {
+        // A BMP router's own entry holds no RIB records (its routes live
+        // under its peers' and path-children's ids), so there is nothing to
+        // reset, and a reset walks every store: it ran on every exporter
+        // reconnect, awaited by the read loop before the dump was read.
+        if self
+            .ingress_register
+            .get(ingress_id)
+            .is_some_and(|i| i.ingress_type == Some(ingress::IngressType::Bmp))
+        {
+            return;
+        }
         let rib = self.rib.load().clone();
         if let Err(e) = tokio::task::spawn_blocking(move || {
             rib.remove_for_ingresses(&[ingress_id]);

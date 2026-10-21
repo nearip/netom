@@ -38,7 +38,7 @@ authors = ["NLnet Labs <routing-team@nlnetlabs.nl>", "FastNetMon Inc <support@fa
 [workspace.dependencies]
 routecore          = { git = "https://github.com/FastNetMon/routecore.git", features = ["bgp", "bmp", "serde", "fsm", "mrt"] }
 inetnum            = { git = "https://github.com/FastNetMon/inetnum.git", tag = "v0.1.1-fnm1", features = ["arbitrary", "serde"] }
-rotonda-store      = { git = "https://github.com/FastNetMon/netom-store.git", branch = "fnm-gc" }   # fork: Layer A remove_mui
+rotonda-store      = { git = "https://github.com/nearip/netom-store.git", rev = "2d853e12059b92ee2f1c4a0ece7a0b65665230a1" }   # fork of netom-store fnm-gc: batched mui removal (FastNetMon/netom-store PR pending)
 log                = "0.4"
 
 
@@ -83,6 +83,7 @@ memmap2            = "0.9.9"
 non-empty-vec      = { version = "0.2", features = ["serde"]}
 roto               = { git = "https://github.com/FastNetMon/roto.git", tag = "v0.7.1-fnm2" }
 rotonda-store      = { workspace = true }
+roaring            = "0.10"
 serde_with         = "3"
 smallvec           = { version = "1.15", features = ["const_generics", "const_new", "union"] }
 socket2            = "0.6" # TCP keepalive on accepted bmp-out sockets; already pulled in transitively by tokio
@@ -204,3 +205,4 @@ systemd-units = { unit-name = "netom", unit-scripts = "pkg/common", enable = fal
 
 
 [package.metadata.deb.variants.minimal]
+

@@ -31,6 +31,12 @@ use crate::roto_runtime::types::PeerRibType;
 pub struct Register {
     serial: AtomicU32,
     info: RwLock<HashMap<IngressId, IngressInfo>>,
+    /// ADD-PATH path-children by `(parent_ingress, path_id)`, so a child is
+    /// found again without scanning the register. Written only while `info`
+    /// is write-locked (lock order: `info`, then this). An entry may outlive
+    /// its child or point at a child whose identity changed; every lookup
+    /// re-checks the child in `info`.
+    path_children: std::sync::Mutex<HashMap<(IngressId, u32), IngressId>>,
 }
 
 pub type IngressId = u32;
@@ -220,8 +226,10 @@ macro_rules! info_for_field{
                     $(
                         update_field!(old, new_info, $field);
                     )*
+                    self.index_path_child(id, &old);
                     lock.insert(id, old) // returns the replaced info
                 } else {
+                    self.index_path_child(id, &new_info);
                     lock.insert(id, new_info) // returns the replaced info
                 }
             }
@@ -267,6 +275,7 @@ impl Register {
         Self {
             serial: 1.into(),
             info: RwLock::new(HashMap::new()),
+            path_children: Default::default(),
         }
     }
 
@@ -593,7 +602,39 @@ impl Register {
     ///
     /// Returns the [`IngressInfo`] if the entry existed, `None` otherwise.
     pub fn remove(&self, id: IngressId) -> Option<IngressInfo> {
-        self.info.write().unwrap().remove(&id)
+        let mut lock = self.info.write().unwrap();
+        let removed = lock.remove(&id);
+        if let Some(info) = &removed {
+            self.unindex_path_child(id, info);
+        }
+        removed
+    }
+
+    /// Record a path-child under `(parent_ingress, path_id)`. Caller holds
+    /// the `info` write lock.
+    fn index_path_child(&self, id: IngressId, info: &IngressInfo) {
+        if let (Some(IngressType::BgpPath), Some(parent), Some(path_id)) =
+            (info.ingress_type, info.parent_ingress, info.path_id)
+        {
+            self.path_children
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert((parent, path_id), id);
+        }
+    }
+
+    /// Drop a removed path-child's index entry, if it still points at it.
+    /// Caller holds the `info` write lock.
+    fn unindex_path_child(&self, id: IngressId, info: &IngressInfo) {
+        if let (Some(IngressType::BgpPath), Some(parent), Some(path_id)) =
+            (info.ingress_type, info.parent_ingress, info.path_id)
+        {
+            let mut index =
+                self.path_children.lock().unwrap_or_else(|p| p.into_inner());
+            if index.get(&(parent, path_id)) == Some(&id) {
+                index.remove(&(parent, path_id));
+            }
+        }
     }
 
     /// Remove an ingress entry only if it is currently `Disconnected`.
@@ -612,7 +653,11 @@ impl Register {
         let mut lock = self.info.write().unwrap();
         match lock.get(&id) {
             Some(info) if info.state == Some(IngressState::Disconnected) => {
-                lock.remove(&id)
+                let removed = lock.remove(&id);
+                if let Some(info) = &removed {
+                    self.unindex_path_child(id, info);
+                }
+                removed
             }
             _ => None,
         }
@@ -821,25 +866,29 @@ impl Register {
         parent: IngressId,
         path_id: u32,
     ) -> Option<IngressId> {
+        // By index, not by scanning the register: this runs for every path
+        // id a session has not seen yet, i.e. for most of an ADD-PATH dump,
+        // inline on the BMP read loop and under the write lock. Scanning
+        // ~1e6 entries per mint stalled ingest for minutes per dump.
         let mut lock = self.info.write().unwrap();
-        for (id, info) in lock.iter_mut() {
-            if info.state == Some(IngressState::Connected) {
-                continue;
-            }
-            if info.ingress_type == Some(IngressType::BgpPath)
-                && info.parent_ingress == Some(parent)
-                && info.path_id == Some(path_id)
-            {
-                info.state = Some(IngressState::Connected);
-                info.history_generation =
-                    info.history_generation.saturating_add(1);
-                info.history_revision =
-                    info.history_revision.saturating_add(1);
-                info.path_activity = info.path_activity.saturating_add(1);
-                return Some(*id);
-            }
+        let id = *self
+            .path_children
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&(parent, path_id))?;
+        let info = lock.get_mut(&id)?;
+        if info.state == Some(IngressState::Connected)
+            || info.ingress_type != Some(IngressType::BgpPath)
+            || info.parent_ingress != Some(parent)
+            || info.path_id != Some(path_id)
+        {
+            return None;
         }
-        None
+        info.state = Some(IngressState::Connected);
+        info.history_generation = info.history_generation.saturating_add(1);
+        info.history_revision = info.history_revision.saturating_add(1);
+        info.path_activity = info.path_activity.saturating_add(1);
+        Some(id)
     }
 
     /// Search existing [`IngressId`] on the BMP router leven
