@@ -185,6 +185,14 @@ pub struct Rib {
     // loses a CAS race livelocks indefinitely. Holding this mutex around
     // every call guarantees there's only ever one in flight.
     withdraw_lock: Arc<Mutex<()>>,
+    /// Records each ADD-PATH path-child owns, both families and both stores.
+    /// A path-child's record is removed on its withdrawal, and the child is
+    /// retired the moment it owns none (`path_child_record_removed`), so no
+    /// walk of the table is needed to find idle children.
+    path_child_records: Arc<Mutex<HashMap<IngressId, u32>>>,
+    /// Path-children retired because they own no record: the GC drops their
+    /// register entries without walking the stores for their records.
+    retired_empty_children: Arc<Mutex<HashSet<IngressId>>>,
     // Serialises the read-modify-write of FlowSpecRuleSet blobs: the store
     // overwrites whole records per (prefix, mui), so two concurrent
     // upserts of different rules under the same key would lose one rule
@@ -287,6 +295,8 @@ impl Rib {
                 PathAttributeInterner::default(),
             ),
             withdraw_lock: Arc::new(Mutex::new(())),
+            path_child_records: Default::default(),
+            retired_empty_children: Default::default(),
             flowspec_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -716,6 +726,22 @@ impl Rib {
             if let Some(gauge) = &gauge {
                 gauge.sub_adj_rib_in(afi_safi, 1);
             }
+            // A path-child's last rule gone: its record goes too, and the
+            // child is retired once it owns none (see `insert_prefix`).
+            if ruleset.is_empty() && self.ingress_register.is_path_child(mui)
+            {
+                let removed = store.remove_record(&key, mui)?;
+                self.flowspec_rule_counts.add(is_v4, -1);
+                if removed {
+                    self.path_child_record_removed(mui);
+                }
+                return Ok(UpsertReport {
+                    cas_count: 0,
+                    prefix_new: false,
+                    mui_new: false,
+                    mui_count: usize::from(removed),
+                });
+            }
             let (status, ltime) = if ruleset.is_empty() {
                 (RouteStatus::Withdrawn, ltime)
             } else {
@@ -736,6 +762,11 @@ impl Rib {
         let replaced = ruleset.upsert(nlri_raw, pamap, validity);
         let pubrec = Record::new(mui, ltime, route_status, ruleset);
         let report = store.insert(&key, pubrec, None);
+        if let Ok(r) = &report {
+            if r.mui_new && self.ingress_register.is_path_child(mui) {
+                self.path_child_record_added(mui);
+            }
+        }
         if report.is_ok() {
             if !replaced {
                 self.flowspec_rule_counts.add(is_v4, 1);
@@ -1081,6 +1112,23 @@ impl Rib {
                 gauge.sub_adj_rib_in(afi_safi, 1);
             }
 
+            // A path-child stands for one path of one session (RFC 7911): a
+            // withdrawn path is gone, so its record is removed rather than
+            // kept as a withdrawn tombstone, and the child is retired once it
+            // owns none. O(1); no walk.
+            if self.ingress_register.is_path_child(mui) {
+                let removed = store.remove_record(prefix, mui)?;
+                if removed {
+                    self.path_child_record_removed(mui);
+                }
+                return Ok(UpsertReport {
+                    cas_count: 0,
+                    prefix_new: false,
+                    mui_new: false,
+                    mui_count: usize::from(removed),
+                });
+            }
+
             if !retain_withdrawn_attributes {
                 if !store.contains(prefix, Some(mui)) {
                     return Ok(UpsertReport {
@@ -1158,6 +1206,15 @@ impl Rib {
         let report = store.insert(
             prefix, pubrec, None, // Option<TBI>
         );
+
+        if let Ok(r) = &report {
+            if r.mui_new
+                && route_status == RouteStatus::Active
+                && self.ingress_register.is_path_child(mui)
+            {
+                self.path_child_record_added(mui);
+            }
+        }
 
         // Only a not-active -> active transition grows the Adj-RIB-In. A
         // re-advertisement of a prefix the peer already has is an implicit
@@ -1397,6 +1454,54 @@ impl Rib {
     /// retained previous session before reusing an id. Synthesized BMP peers
     /// that mint a fresh ingress id every session must take this path so
     /// mark-withdraw does not leak one record slot per announced prefix.
+    fn path_child_record_added(&self, child: IngressId) {
+        *self
+            .path_child_records
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(child)
+            .or_insert(0) += 1;
+        self.retired_empty_children
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&child);
+    }
+
+    fn path_child_record_removed(&self, child: IngressId) {
+        let empty = {
+            let mut counts = self
+                .path_child_records
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match counts.get_mut(&child) {
+                Some(n) if *n > 1 => {
+                    *n -= 1;
+                    false
+                }
+                _ => {
+                    counts.remove(&child);
+                    true
+                }
+            }
+        };
+        if empty && self.ingress_register.retire_empty_path_child(child) {
+            self.retired_empty_children
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(child);
+        }
+    }
+
+    /// Records the path-children own, for tests and metrics.
+    pub fn path_child_record_count(&self, child: IngressId) -> u32 {
+        self.path_child_records
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&child)
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub fn remove_for_ingresses(&self, ids: &[IngressId]) {
         if ids.is_empty() {
             return;
@@ -1415,7 +1520,31 @@ impl Rib {
         // of prefixes, and the muis leave each store's withdrawn index in one
         // swap: the lock serializes writes to that index (see the field
         // comment), so it is held for one chunk, never for a walk.
-        let muis: RoaringBitmap = ids.iter().copied().collect();
+        // Path-children retired because they own nothing need no walk: only
+        // their register entries go (the GC's job).
+        let muis: RoaringBitmap = {
+            let mut empty = self
+                .retired_empty_children
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut counts = self
+                .path_child_records
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ids.iter()
+                .copied()
+                .filter(|id| {
+                    counts.remove(id);
+                    !(empty.remove(id))
+                })
+                .collect()
+        };
+        if muis.is_empty() {
+            for &id in ids {
+                reset_peer_gauge(id, None);
+            }
+            return;
+        }
         let lock = || {
             self.withdraw_lock
                 .lock()
@@ -1764,135 +1893,6 @@ impl Rib {
             added += 1;
         }
         added
-    }
-
-    /// Retire ADD-PATH path-children that no longer own an active route.
-    ///
-    /// A child is minted per `(session, path_id)` and, until this ran, was
-    /// only ever reclaimed when its *session* went down: `get_or_create_path_child`
-    /// registers it `Connected`, and [`gc_disconnected_bmp_peers`](
-    /// Self::gc_disconnected_bmp_peers) considers `Disconnected` entries only.
-    /// A router that allocates path ids monotonically and never reuses them --
-    /// which is what the ones in the field do -- therefore grows the register
-    /// for as long as the session stays up. A production collector reached
-    /// 1.34M children, one peer holding 110,914 of them, against a table that
-    /// was not growing; `scripts/addpath-churn.sh` reproduces it at 100% of
-    /// churn retained.
-    ///
-    /// Withdrawing a path leaves its child owning nothing but tombstones, so
-    /// "owns no active record" is the retirement condition. This marks such
-    /// children `Disconnected` and leaves the reclaiming to the GC above,
-    /// which already knows how to drop a path-child's register entry and its
-    /// leftover records together.
-    ///
-    /// A child is retired only if it owned nothing in two consecutive
-    /// sweeps and its activity generation is unchanged across both scans.
-    /// The final generation check and retirement share the register lock,
-    /// so an announcement resolved during a scan invalidates its snapshot.
-    /// Returns idle children and their generations for the next sweep.
-    pub fn reap_idle_path_children(
-        &self,
-        prev: HashMap<IngressId, u64>,
-    ) -> HashMap<IngressId, u64> {
-        let children: HashMap<IngressId, u64> = self
-            .ingress_register
-            .cloned_info()
-            .into_iter()
-            .filter(|(_, info)| {
-                info.ingress_type == Some(ingress::IngressType::BgpPath)
-                    && info.state
-                        == Some(ingress::register::IngressState::Connected)
-            })
-            .map(|(id, info)| (id, info.path_activity))
-            .collect();
-        if children.is_empty() {
-            return HashMap::new();
-        }
-
-        // Which muis still own an active record. Walked prefix-major and in
-        // chunks under short-lived guards, the way the jsonl dump does it:
-        // one guard held across the whole table would pin concurrent churn
-        // garbage for the length of the walk.
-        let mut active_muis: HashSet<IngressId> = HashSet::new();
-        for store in [self.unicast.as_ref(), self.multicast.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            let keys: Vec<Prefix> = store
-                .prefixes_keys_iter_v4()
-                .chain(store.prefixes_keys_iter_v6())
-                .collect();
-            for chunk in keys.chunks(DUMP_KEY_CHUNK) {
-                for &prefix in chunk {
-                    // include_withdrawn = false: a child holding only
-                    // tombstones owns nothing worth keeping it for.
-                    match store.get_records_for_prefix(&prefix, None, false) {
-                        Ok(Some(records)) => {
-                            for r in records {
-                                active_muis.insert(r.multi_uniq_id);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(err) => {
-                            warn!("abandoning idle path scan: {err}");
-                            return HashMap::new();
-                        }
-                    }
-                }
-            }
-        }
-
-        // FlowSpec children can have no unicast/multicast record at all.
-        // Keep them while either family's rule-set is active.
-        if let Some(store) = self.flowspec.as_ref() {
-            let keys: Vec<Prefix> = store
-                .prefixes_keys_iter_v4()
-                .chain(store.prefixes_keys_iter_v6())
-                .collect();
-            for prefix in keys {
-                match store.get_records_for_prefix(&prefix, None, false) {
-                    Ok(Some(records)) => {
-                        for r in records {
-                            if !r.meta.is_empty() {
-                                active_muis.insert(r.multi_uniq_id);
-                            }
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        warn!("abandoning idle path scan: {err}");
-                        return HashMap::new();
-                    }
-                }
-            }
-        }
-
-        let idle: HashMap<IngressId, u64> = children
-            .iter()
-            .filter(|(id, _)| !active_muis.contains(id))
-            .map(|(&id, &activity)| (id, activity))
-            .collect();
-
-        let retired = idle
-            .iter()
-            .filter(|(id, activity)| {
-                prev.get(id) == Some(activity)
-                    && self
-                        .ingress_register
-                        .retire_path_child(**id, **activity)
-            })
-            .count();
-        if retired > 0 {
-            info!(
-                "rib reap: retired {} ADD-PATH path-child ingress(es) \
-                 with no active routes ({} children, {} still routing)",
-                retired,
-                children.len(),
-                active_muis.len(),
-            );
-        }
-
-        idle
     }
 
     /// Layer C garbage-collection sweep. Reclaims idle register entries that
@@ -4229,7 +4229,7 @@ mod tests {
     /// whole-mui removal like any other record.
 
     #[test]
-    fn reap_keeps_both_flowspec_families_until_withdrawn() {
+    fn flowspec_path_children_retire_when_their_last_rule_goes() {
         use crate::ingress::register::IngressState;
         let rib = test_rib();
         let reg = &rib.ingress_register;
@@ -4267,9 +4267,7 @@ mod tests {
             };
             rib.insert(&route, RouteStatus::Active, 0, id, false, false)
                 .unwrap();
-            let idle = rib.reap_idle_path_children(Default::default());
-            assert!(!idle.contains_key(&id));
-            rib.reap_idle_path_children(idle);
+            assert_eq!(rib.path_child_record_count(id), 1);
             let prev = rib.gc_disconnected_bmp_peers(HashSet::new());
             rib.gc_disconnected_bmp_peers(prev);
             assert_eq!(
@@ -4280,8 +4278,13 @@ mod tests {
             );
             rib.insert(&route, RouteStatus::Withdrawn, 0, id, false, false)
                 .unwrap();
-            let idle = rib.reap_idle_path_children(Default::default());
-            rib.reap_idle_path_children(idle);
+            // The last rule gone: the record is removed and the child
+            // retired at once, for the GC to reclaim.
+            assert_eq!(rib.path_child_record_count(id), 0);
+            assert_eq!(
+                reg.get(id).unwrap().state,
+                Some(IngressState::Disconnected)
+            );
             let prev = rib.gc_disconnected_bmp_peers(HashSet::new());
             rib.gc_disconnected_bmp_peers(prev);
             assert!(reg.get(id).is_none());

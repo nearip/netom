@@ -31,12 +31,6 @@ use crate::roto_runtime::types::PeerRibType;
 pub struct Register {
     serial: AtomicU32,
     info: RwLock<HashMap<IngressId, IngressInfo>>,
-    /// ADD-PATH path-children by `(parent_ingress, path_id)`, so a child is
-    /// found again without scanning the register. Written only while `info`
-    /// is write-locked (lock order: `info`, then this). An entry may outlive
-    /// its child or point at a child whose identity changed; every lookup
-    /// re-checks the child in `info`.
-    path_children: std::sync::Mutex<HashMap<(IngressId, u32), IngressId>>,
 }
 
 pub type IngressId = u32;
@@ -226,10 +220,8 @@ macro_rules! info_for_field{
                     $(
                         update_field!(old, new_info, $field);
                     )*
-                    self.index_path_child(id, &old);
                     lock.insert(id, old) // returns the replaced info
                 } else {
-                    self.index_path_child(id, &new_info);
                     lock.insert(id, new_info) // returns the replaced info
                 }
             }
@@ -275,7 +267,6 @@ impl Register {
         Self {
             serial: 1.into(),
             info: RwLock::new(HashMap::new()),
-            path_children: Default::default(),
         }
     }
 
@@ -309,7 +300,7 @@ impl Register {
     ///
     /// The BMP state machine and the BGP router handler each cache
     /// `path_id -> child ingress` per peer. Once the reap retires a child
-    /// (see `Rib::reap_idle_path_children`) that cache entry is stale, and
+    /// (see `Rib::path_child_record_removed`) that cache entry is stale, and
     /// if its path id is never reused it would never be looked up again --
     /// it would simply sit there, growing the map for the life of the
     /// session. Callers prune periodically rather than per update.
@@ -602,39 +593,7 @@ impl Register {
     ///
     /// Returns the [`IngressInfo`] if the entry existed, `None` otherwise.
     pub fn remove(&self, id: IngressId) -> Option<IngressInfo> {
-        let mut lock = self.info.write().unwrap();
-        let removed = lock.remove(&id);
-        if let Some(info) = &removed {
-            self.unindex_path_child(id, info);
-        }
-        removed
-    }
-
-    /// Record a path-child under `(parent_ingress, path_id)`. Caller holds
-    /// the `info` write lock.
-    fn index_path_child(&self, id: IngressId, info: &IngressInfo) {
-        if let (Some(IngressType::BgpPath), Some(parent), Some(path_id)) =
-            (info.ingress_type, info.parent_ingress, info.path_id)
-        {
-            self.path_children
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert((parent, path_id), id);
-        }
-    }
-
-    /// Drop a removed path-child's index entry, if it still points at it.
-    /// Caller holds the `info` write lock.
-    fn unindex_path_child(&self, id: IngressId, info: &IngressInfo) {
-        if let (Some(IngressType::BgpPath), Some(parent), Some(path_id)) =
-            (info.ingress_type, info.parent_ingress, info.path_id)
-        {
-            let mut index =
-                self.path_children.lock().unwrap_or_else(|p| p.into_inner());
-            if index.get(&(parent, path_id)) == Some(&id) {
-                index.remove(&(parent, path_id));
-            }
-        }
+        self.info.write().unwrap().remove(&id)
     }
 
     /// Remove an ingress entry only if it is currently `Disconnected`.
@@ -653,11 +612,7 @@ impl Register {
         let mut lock = self.info.write().unwrap();
         match lock.get(&id) {
             Some(info) if info.state == Some(IngressState::Disconnected) => {
-                let removed = lock.remove(&id);
-                if let Some(info) = &removed {
-                    self.unindex_path_child(id, info);
-                }
-                removed
+                lock.remove(&id)
             }
             _ => None,
         }
@@ -701,6 +656,32 @@ impl Register {
         true
     }
 
+    /// Whether `id` is an ADD-PATH path-child. A read, no clone.
+    pub fn is_path_child(&self, id: IngressId) -> bool {
+        self.info
+            .read()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|i| i.ingress_type == Some(IngressType::BgpPath))
+    }
+
+    /// Retire a connected path-child that owns no record any more: it goes
+    /// `Disconnected` and the GC reclaims its entry. Returns whether it did.
+    pub fn retire_empty_path_child(&self, id: IngressId) -> bool {
+        let mut lock = self.info.write().unwrap();
+        let Some(info) = lock.get_mut(&id) else {
+            return false;
+        };
+        if info.ingress_type != Some(IngressType::BgpPath)
+            || info.state != Some(IngressState::Connected)
+        {
+            return false;
+        }
+        info.state = Some(IngressState::Disconnected);
+        info.history_revision = info.history_revision.saturating_add(1);
+        true
+    }
+
     /// Validate a cached path-child and reactivate it atomically with GC.
     /// Recording activity also invalidates any in-progress idle scan.
     pub fn refresh_path_child(
@@ -721,28 +702,6 @@ impl Register {
         }
         info.path_activity = info.path_activity.saturating_add(1);
         info.state = Some(IngressState::Connected);
-        true
-    }
-
-    /// Retire only the exact idle generation observed by both sweeps.
-    pub(crate) fn retire_path_child(
-        &self,
-        id: IngressId,
-        activity: u64,
-    ) -> bool {
-        let mut lock = self.info.write().unwrap();
-        let Some(info) = lock.get_mut(&id) else {
-            return false;
-        };
-        if info.ingress_type != Some(IngressType::BgpPath)
-            || info.state != Some(IngressState::Connected)
-            || info.path_activity != activity
-            || activity == u64::MAX
-        {
-            return false;
-        }
-        info.state = Some(IngressState::Disconnected);
-        info.history_revision = info.history_revision.saturating_add(1);
         true
     }
 
@@ -850,45 +809,6 @@ impl Register {
             }
         }
         None
-    }
-
-    /// Find an existing ADD-PATH path-child of `parent` for `path_id` and
-    /// atomically *claim* it by flipping it to `Connected` under a single
-    /// write lock (same TOCTOU reasoning as
-    /// [`find_existing_peer_and_claim`](Self::find_existing_peer_and_claim)).
-    ///
-    /// Children are matched on `{ingress_type == BgpPath, parent_ingress,
-    /// path_id}` — the identity that must stay stable across session flaps so
-    /// a re-announced path rebinds to its previous mui and re-activates its
-    /// withdrawn RIB records instead of minting a new id per flap.
-    pub fn find_existing_path_child_and_claim(
-        &self,
-        parent: IngressId,
-        path_id: u32,
-    ) -> Option<IngressId> {
-        // By index, not by scanning the register: this runs for every path
-        // id a session has not seen yet, i.e. for most of an ADD-PATH dump,
-        // inline on the BMP read loop and under the write lock. Scanning
-        // ~1e6 entries per mint stalled ingest for minutes per dump.
-        let mut lock = self.info.write().unwrap();
-        let id = *self
-            .path_children
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&(parent, path_id))?;
-        let info = lock.get_mut(&id)?;
-        if info.state == Some(IngressState::Connected)
-            || info.ingress_type != Some(IngressType::BgpPath)
-            || info.parent_ingress != Some(parent)
-            || info.path_id != Some(path_id)
-        {
-            return None;
-        }
-        info.state = Some(IngressState::Connected);
-        info.history_generation = info.history_generation.saturating_add(1);
-        info.history_revision = info.history_revision.saturating_add(1);
-        info.path_activity = info.path_activity.saturating_add(1);
-        Some(id)
     }
 
     /// Search existing [`IngressId`] on the BMP router leven
@@ -1381,42 +1301,6 @@ mod tests {
                 .with_state(state),
         );
         id
-    }
-
-    #[test]
-    fn path_child_claim_reuses_disconnected() {
-        let res = Register::new();
-        let session = res.register();
-        let child =
-            mk_path_child(&res, session, 7, IngressState::Disconnected);
-
-        let claimed = res.find_existing_path_child_and_claim(session, 7);
-        assert_eq!(claimed, Some(child));
-        // The claim itself must flip the entry to Connected...
-        assert_eq!(
-            res.get(child).unwrap().state,
-            Some(IngressState::Connected)
-        );
-        // ...so a second claim for the same identity finds nothing.
-        assert_eq!(res.find_existing_path_child_and_claim(session, 7), None);
-    }
-
-    #[test]
-    fn path_child_claim_ignores_connected_and_other_identities() {
-        let res = Register::new();
-        let session = res.register();
-        let other_session = res.register();
-        mk_path_child(&res, session, 7, IngressState::Connected);
-        mk_path_child(&res, session, 8, IngressState::Disconnected);
-        mk_path_child(&res, other_session, 7, IngressState::Connected);
-
-        // Connected child of the right identity: not claimable.
-        assert_eq!(res.find_existing_path_child_and_claim(session, 7), None);
-        // Wrong parent: not claimable either.
-        assert_eq!(
-            res.find_existing_path_child_and_claim(other_session, 8),
-            None
-        );
     }
 
     #[test]

@@ -2138,15 +2138,14 @@ impl PeerAware for PeerStates {
         }
 
         let session_id = peer_state.ingress_id;
-        // Prefer rebinding the Disconnected child a previous flap of this
-        // session left behind: its RIB records are re-activated on the
-        // next Active insert instead of duplicated under a fresh mui.
-        let (child_id, minted) = match register
-            .find_existing_path_child_and_claim(session_id, path_id.0)
-        {
-            Some(id) => (id, false),
-            None => (register.register(), true),
-        };
+        // Always a fresh child, never the one a previous session left with
+        // the same path id: a path id identifies a path only within its BGP
+        // session (RFC 7911 section 3, "purely a local matter"), and a BMP
+        // session restart begins with Peer Up and a complete initial dump
+        // (RFC 7854 section 3.3), so equal numbers across sessions say
+        // nothing about the path. The previous session's children leave
+        // with that session.
+        let (child_id, minted) = (register.register(), true);
         // Always (re-)apply the child info: creates the entry on a fresh
         // mint, refreshes the display fields on a claim (update_info
         // merges Some-fields only).

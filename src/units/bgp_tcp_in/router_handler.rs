@@ -958,9 +958,8 @@ impl Processor {
     }
 
     /// Resolve — lazily minting if needed — the ADD-PATH path-child ingress
-    /// for `(session, path_id)`. Prefers rebinding the Disconnected child a
-    /// previous session with this peer left behind, so re-announced paths
-    /// re-activate their RIB records under the same mui.
+    /// for `(session, path_id)`. A previous session's children are never
+    /// rebound: a path id is local to its session (RFC 7911 section 3).
     fn get_or_create_path_child(
         &mut self,
         session_id: ingress::IngressId,
@@ -976,13 +975,9 @@ impl Processor {
             self.path_children.remove(&path_id);
         }
 
-        let child_id = match self
-            .ingresses
-            .find_existing_path_child_and_claim(session_id, path_id.0)
-        {
-            Some(id) => id,
-            None => self.ingresses.register(),
-        };
+        // A fresh child, never the previous session's with the same path id
+        // (RFC 7911 section 3: a path id is local to its session).
+        let child_id = self.ingresses.register();
         // Copy the session's peer identity onto the child for display in
         // the HTTP /ingresses output; one register lookup per mint only.
         let mut info = ingress::IngressInfo::new()
@@ -1312,8 +1307,9 @@ mod path_child_lifecycle_tests {
             Processor::mock(BgpTcpIn::mock("dummy", Asn::from_u32(12345)));
         let session = processor.ingresses.register();
         let old = processor.get_or_create_path_child(session, PathId(77));
-        let generation = processor.ingresses.get(old).unwrap().path_activity;
-        assert!(processor.ingresses.retire_path_child(old, generation));
+        // Retired (it owned no record), then announced again before the GC:
+        // the cached child is reactivated.
+        assert!(processor.ingresses.retire_empty_path_child(old));
         assert_eq!(
             processor.get_or_create_path_child(session, PathId(77)),
             old
@@ -1322,10 +1318,8 @@ mod path_child_lifecycle_tests {
             processor.ingresses.get(old).unwrap().state,
             Some(IngressState::Connected)
         );
-        // An idle scan based on the pre-reactivation snapshot must fail.
-        assert!(!processor.ingresses.retire_path_child(old, generation));
-        let generation = processor.ingresses.get(old).unwrap().path_activity;
-        assert!(processor.ingresses.retire_path_child(old, generation));
+        // Retired again and reclaimed by the GC: the next one is fresh.
+        assert!(processor.ingresses.retire_empty_path_child(old));
         processor.ingresses.remove_if_disconnected(old).unwrap();
         let next = processor.get_or_create_path_child(session, PathId(77));
         assert_ne!(old, next);

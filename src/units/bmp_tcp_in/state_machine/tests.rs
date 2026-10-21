@@ -425,9 +425,9 @@ fn addpath_routes_store_under_path_children_and_tear_down_with_peer() {
         );
     }
 
-    // A reconnect that re-announces path id 1 rebinds the same child
-    // (claimed back from Disconnected), so its RIB records re-activate
-    // under the same mui instead of duplicating under a fresh one.
+    // A reconnect that re-announces path id 1 gets a fresh child: a path id
+    // is local to its session (RFC 7911 section 3), and the previous
+    // session's children leave with it.
     let peer_up_msg_buf = mk_addpath_peer_up_notification_msg(&pph);
     let processor = res
         .next_state
@@ -442,10 +442,14 @@ fn addpath_routes_store_under_path_children_and_tear_down_with_peer() {
         panic!("expected Update::Bulk");
     };
     assert_eq!(payloads.len(), 1);
-    assert_eq!(payloads[0].ingress_id, child_ids[0]);
+    assert!(!child_ids.contains(&payloads[0].ingress_id));
+    assert_eq!(
+        register.get(payloads[0].ingress_id).unwrap().state,
+        Some(IngressState::Connected)
+    );
     assert_eq!(
         register.get(child_ids[0]).unwrap().state,
-        Some(IngressState::Connected)
+        Some(IngressState::Disconnected)
     );
 }
 
@@ -480,15 +484,16 @@ fn addpath_cached_child_reactivation_and_teardown_after_gc() {
     };
     let res = processor.process_msg(Instant::now(), announce(), None);
     let old = child_id(&res);
-    let generation = register.get(old).unwrap().path_activity;
-    assert!(register.retire_path_child(old, generation));
+    assert!(register.retire_empty_path_child(old));
     let res = res.next_state.process_msg(Instant::now(), announce(), None);
     assert_eq!(child_id(&res), old);
     assert_eq!(
         register.get(old).unwrap().state,
         Some(IngressState::Connected)
     );
-    assert!(!register.retire_path_child(old, generation));
+    assert!(register.retire_empty_path_child(old));
+    // Retired again: a later announcement would refresh it, but this
+    // test now lets the GC remove it.
     register.mark_disconnected(old);
     register.remove_if_disconnected(old).unwrap();
     let res = res.next_state.process_msg(Instant::now(), announce(), None);
@@ -504,6 +509,61 @@ fn addpath_cached_child_reactivation_and_teardown_after_gc() {
         None,
     );
     assert!(register.get(fresh).is_none());
+}
+
+#[test]
+fn a_new_session_never_rebinds_a_previous_sessions_path_child() {
+    // RFC 7911 section 3: a path id is local to its BGP session, so the same
+    // number after a session restart says nothing about the path.
+    let register: Arc<crate::ingress::Register> = Arc::default();
+    let pph = mk_per_peer_header("127.0.0.1", 12345);
+    let child_id = |res: &super::processing::ProcessingResult| {
+        let MessageType::RoutingUpdate {
+            update: Update::Bulk(payloads),
+            ..
+        } = &res.message_type
+        else {
+            panic!("expected routes");
+        };
+        payloads[0].ingress_id
+    };
+    let res = mk_test_processor_with_register(&register)
+        .process_msg(
+            Instant::now(),
+            mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC),
+            None,
+        )
+        .next_state
+        .process_msg(
+            Instant::now(),
+            mk_addpath_peer_up_notification_msg(&pph),
+            None,
+        )
+        .next_state
+        .process_msg(
+            Instant::now(),
+            mk_addpath_v4_route_monitoring_msg(&pph, &[77]),
+            None,
+        );
+    let first = child_id(&res);
+    let res = res
+        .next_state
+        .process_msg(Instant::now(), mk_peer_down_notification_msg(&pph), None)
+        .next_state
+        .process_msg(
+            Instant::now(),
+            mk_addpath_peer_up_notification_msg(&pph),
+            None,
+        )
+        .next_state
+        .process_msg(
+            Instant::now(),
+            mk_addpath_v4_route_monitoring_msg(&pph, &[77]),
+            None,
+        );
+    let second = child_id(&res);
+    assert_ne!(second, first, "path id 77 of the new session is a new path");
+    assert_eq!(register.get(second).unwrap().path_id, Some(77));
 }
 
 #[test]
