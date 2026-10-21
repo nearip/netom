@@ -23,6 +23,7 @@ use rotonda_store::{
     rib::{config::MemoryOnlyConfig, StarCastRib},
     stats::UpsertReport,
 };
+use routecore::bmp::message::RibType;
 use routecore::bgp::{
     aspath::HopPath,
     nlri::afisafi::{AfiSafiNlri, IsPrefix, Nlri},
@@ -2752,9 +2753,12 @@ impl Rib {
                     }
                 }
                 if let Some(origin_asn) = filter.origin_asn {
-                    if Some(origin_asn) != path_attributes.get::<HopPath>().and_then(|hp|
-                        hp.origin().and_then(|hop| hop.clone().try_into().ok())
-                    ) {
+                    let session = ingress_info
+                        .get(&r.multi_uniq_id)
+                        .map(|ii| session_info(ii, ingress_info));
+                    if Some(origin_asn)
+                        != route_origin_asn(path_attributes.get::<HopPath>(), session)
+                    {
                         return false;
                     }
                 }
@@ -3205,6 +3209,46 @@ impl RouteSource {
             }
         }
     }
+}
+
+/// The session an ingress belongs to: an ADD-PATH path-child
+/// ([`IngressType::BgpPath`]) carries no session data of its own, so it
+/// resolves to its parent.
+pub(crate) fn session_info<'a>(
+    info: &'a IngressInfo,
+    all: &'a HashMap<IngressId, IngressInfo>,
+) -> &'a IngressInfo {
+    if info.ingress_type == Some(IngressType::BgpPath) {
+        if let Some(parent) = info.parent_ingress.and_then(|p| all.get(&p)) {
+            return parent;
+        }
+    }
+    info
+}
+
+/// The AS that originated a route, for `filter[originAsn]`.
+///
+/// A non-empty AS_PATH names it: its last AS. An empty AS_PATH means the route
+/// was originated inside the AS of the speaker that sent it, because every
+/// eBGP hop prepends its own AS (RFC 4271, section 5.1.2). That AS is known
+/// when the session is internal: an iBGP session (remote AS equal to local
+/// AS), or a BMP Loc-RIB view (RFC 9069), whose peer AS is the monitored
+/// router's own. Over eBGP an empty AS_PATH is malformed, and no origin is
+/// claimed for it.
+pub(crate) fn route_origin_asn(
+    hop_path: Option<HopPath>,
+    session: Option<&IngressInfo>,
+) -> Option<Asn> {
+    if let Some(hop_path) = hop_path {
+        if let Some(hop) = hop_path.origin() {
+            return hop.clone().try_into().ok();
+        }
+    }
+    let session = session?;
+    let remote = session.remote_asn?;
+    let internal = session.rib_type == Some(RibType::LocRib)
+        || session.local_asn == Some(remote);
+    internal.then_some(remote)
 }
 
 /// Whether a record stored under `info`'s ingress belongs to a session of
@@ -3692,6 +3736,66 @@ mod tests {
             parent_ingress: parent,
             ..IngressInfo::new()
         }
+    }
+
+    fn hop_path(asns: &[u32]) -> HopPath {
+        let mut hp = HopPath::new();
+        for asn in asns {
+            hp.append(Asn::from_u32(*asn));
+        }
+        hp
+    }
+
+    fn session(remote: u32, local: Option<u32>, rib_type: Option<RibType>) -> IngressInfo {
+        IngressInfo {
+            remote_asn: Some(Asn::from_u32(remote)),
+            local_asn: local.map(Asn::from_u32),
+            rib_type,
+            ..info(IngressType::Bgp, None)
+        }
+    }
+
+    #[test]
+    fn origin_asn_of_a_non_empty_path_is_its_last_as() {
+        let ebgp = session(174, Some(64500), None);
+        assert_eq!(
+            route_origin_asn(Some(hop_path(&[174, 3356, 15169])), Some(&ebgp)),
+            Some(Asn::from_u32(15169))
+        );
+    }
+
+    #[test]
+    fn origin_asn_of_an_empty_path_is_the_internal_senders_as() {
+        // iBGP: the route was originated inside our own AS.
+        let ibgp = session(64500, Some(64500), None);
+        assert_eq!(route_origin_asn(Some(hop_path(&[])), Some(&ibgp)), Some(Asn::from_u32(64500)));
+        assert_eq!(route_origin_asn(None, Some(&ibgp)), Some(Asn::from_u32(64500)));
+
+        // A BMP Loc-RIB view: the peer AS is the monitored router's own.
+        let loc_rib = session(64500, None, Some(RibType::LocRib));
+        assert_eq!(route_origin_asn(Some(hop_path(&[])), Some(&loc_rib)), Some(Asn::from_u32(64500)));
+    }
+
+    #[test]
+    fn origin_asn_of_an_empty_path_over_ebgp_is_unknown() {
+        let ebgp = session(174, Some(64500), None);
+        assert_eq!(route_origin_asn(Some(hop_path(&[])), Some(&ebgp)), None);
+        // A BMP Adj-RIB-In view without a known local AS claims nothing either.
+        let adj_rib_in = session(174, None, Some(RibType::AdjRibIn));
+        assert_eq!(route_origin_asn(Some(hop_path(&[])), Some(&adj_rib_in)), None);
+        // An ingress the register does not know claims nothing.
+        assert_eq!(route_origin_asn(Some(hop_path(&[])), None), None);
+    }
+
+    #[test]
+    fn a_path_child_resolves_to_its_session_for_the_origin() {
+        let parent = session(64500, Some(64500), None);
+        let child = info(IngressType::BgpPath, Some(1));
+        let all = HashMap::from([(1, parent), (2, child.clone())]);
+        assert_eq!(
+            route_origin_asn(Some(hop_path(&[])), Some(session_info(&child, &all))),
+            Some(Asn::from_u32(64500))
+        );
     }
 
     #[test]
