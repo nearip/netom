@@ -1100,15 +1100,13 @@ impl Rib {
             } {
                 return false;
             }
-            // `contains` is a bitmap check with no record-map read: false
-            // means no record at all, which is the overwhelmingly common
-            // case while a peer is loading its table. Only when a record
-            // does exist do we pay for reading its status, which is the
-            // churn path and runs orders of magnitude less often.
-            store.contains(prefix, Some(mui))
-                && store
-                    .get_records_for_prefix(prefix, Some(mui), false)
-                    .is_ok_and(|r| r.is_some_and(|recs| !recs.is_empty()))
+            // Read the record map directly. The store's per-node MUI bitmap
+            // is shared by every prefix that hashes to the node, so
+            // `contains(prefix, Some(mui))` can answer false for a (prefix,
+            // mui) that does hold a record; it is not an authoritative test.
+            store
+                .get_records_for_prefix(prefix, Some(mui), false)
+                .is_ok_and(|r| r.is_some_and(|recs| !recs.is_empty()))
         });
 
         if route_status == RouteStatus::Withdrawn {
@@ -1133,16 +1131,24 @@ impl Rib {
                 });
             }
 
-            if !retain_withdrawn_attributes {
-                if !store.contains(prefix, Some(mui)) {
-                    return Ok(UpsertReport {
-                        cas_count: 0,
-                        prefix_new: false,
-                        mui_new: false,
-                        mui_count: 0,
-                    });
-                }
+            // Whether this (prefix, mui) holds a record, tombstones included,
+            // read from the record map. The bitmap test used here before
+            // skipped real withdrawals after a node hash collision, which
+            // left withdrawn routes active for as long as the session lived.
+            let existed = store
+                .get_records_for_prefix(prefix, Some(mui), true)
+                .map_err(|_| PrefixStoreError::FatalError)?
+                .is_some_and(|records| !records.is_empty());
+            if !existed {
+                return Ok(UpsertReport {
+                    cas_count: 0,
+                    prefix_new: false,
+                    mui_new: false,
+                    mui_count: 0,
+                });
+            }
 
+            if !retain_withdrawn_attributes {
                 let pubrec = Record::new(
                     mui,
                     ltime,
@@ -1161,10 +1167,8 @@ impl Rib {
             //
             // `mui_count` reports whether there was anything to withdraw, so
             // the caller does not count a withdrawal for a {prefix,mui} the
-            // store never held. `contains` is a bitmap check and runs only on
-            // the withdrawal path, never on the announcement hot path. The
-            // other fields stay as they are: nothing was inserted.
-            let existed = store.contains(prefix, Some(mui));
+            // store never held. The other fields stay as they are: nothing
+            // was inserted.
             store.mark_mui_as_withdrawn_for_prefix(prefix, mui, 0)?;
 
             return Ok(UpsertReport {
@@ -1265,7 +1269,11 @@ impl Rib {
             store.prefixes_keys_iter_v6().collect()
         };
         for prefix in keys {
-            if store.contains(&prefix, Some(mui)) {
+            if store
+                .get_records_for_prefix(&prefix, Some(mui), true)
+                .map_err(|_| PrefixStoreError::FatalError)?
+                .is_some_and(|records| !records.is_empty())
+            {
                 store.insert(
                     &prefix,
                     Record::new(
