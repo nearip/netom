@@ -87,31 +87,33 @@ impl WebUI {
             return Err("ingress id {ingress_id} is not a BMP source".into());
         };
 
-        let other_routers = state
-            .ingress_register
-            .cloned_info()
-            .into_iter()
-            .filter(|(id, info)| {
-                info.ingress_type == Some(IngressType::Bmp)
-                    && *id != ingress_id
-            })
-            .map(|(id, info)| BmpRouter::new(id, info))
-            .collect();
+        let other_routers = state.ingress_register.with_info(|all| {
+            all.iter()
+                .filter(|(id, info)| {
+                    info.ingress_type == Some(IngressType::Bmp)
+                        && **id != ingress_id
+                })
+                .map(|(&id, info)| BmpRouter::new(id, info.clone()))
+                .collect()
+        });
 
         let mut bgp_sessions = BTreeMap::new();
 
-        for (id, info) in state.ingress_register.cloned_info().iter().filter(
-            |(_id, info)| {
+        state.ingress_register.with_info(|all| {
+            for (id, info) in all.iter().filter(|(_id, info)| {
                 info.parent_ingress == Some(ingress_id)
                     && info.ingress_type
                         == Some(crate::ingress::IngressType::BgpViaBmp)
-            },
-        ) {
-            let infos: &mut Vec<_> = bgp_sessions
-                .entry((info.remote_asn.unwrap(), info.remote_addr.unwrap()))
-                .or_default();
-            infos.push((*id, info.clone()))
-        }
+            }) {
+                let infos: &mut Vec<_> = bgp_sessions
+                    .entry((
+                        info.remote_asn.unwrap(),
+                        info.remote_addr.unwrap(),
+                    ))
+                    .or_default();
+                infos.push((*id, info.clone()))
+            }
+        });
         BmpDetails {
             router: BmpRouter::new(ingress_id, info),
             other_routers,
@@ -328,27 +330,32 @@ impl WebUI {
             return BmpTree::new();
         }
 
-        let register = state.ingress_register.cloned_info();
+        state.ingress_register.with_info(|register| {
+            for (id, info) in register.iter().filter(|(_id, info)| {
+                info.ingress_type
+                    == Some(crate::ingress::IngressType::BgpViaBmp)
+            }) {
+                let Some((_bmp_ingress_info, bgp)) = res.get_mut(
+                    &info.parent_ingress.expect("should have parent"),
+                ) else {
+                    // if the BMP connection has state 'Disconnected', it is still
+                    // present in the ingress::Register but not in the BmpTree map
+                    // we are building. So skip it.
+                    continue;
+                };
 
-        for (id, info) in register.iter().filter(|(_id, info)| {
-            info.ingress_type == Some(crate::ingress::IngressType::BgpViaBmp)
-        }) {
-            let Some((_bmp_ingress_info, bgp)) = res
-                .get_mut(&info.parent_ingress.expect("should have parent"))
-            else {
-                // if the BMP connection has state 'Disconnected', it is still
-                // present in the ingress::Register but not in the BmpTree map
-                // we are building. So skip it.
-                continue;
-            };
-
-            let infos: &mut Vec<_> = bgp
-                .entry((info.remote_asn.unwrap(), info.remote_addr.unwrap()))
-                .or_default();
-            infos.push((*id, info.clone()));
-            infos.sort_by(|a, b| a.1.peer_rib_type.cmp(&b.1.peer_rib_type));
-        }
-
+                let infos: &mut Vec<_> = bgp
+                    .entry((
+                        info.remote_asn.unwrap(),
+                        info.remote_addr.unwrap(),
+                    ))
+                    .or_default();
+                infos.push((*id, info.clone()));
+                infos.sort_by(|a, b| {
+                    a.1.peer_rib_type.cmp(&b.1.peer_rib_type)
+                });
+            }
+        });
         res
     }
 
@@ -397,7 +404,17 @@ impl WebUI {
     async fn peers_overview(
         state: State<ApiState>,
     ) -> Result<Html<String>, String> {
-        let register = state.ingress_register.cloned_info();
+        let register = state.ingress_register.with_info(|all| {
+            all.iter()
+                .filter(|(_, info)| {
+                    matches!(
+                        info.ingress_type,
+                        Some(IngressType::BgpViaBmp | IngressType::Bgp)
+                    )
+                })
+                .map(|(&id, info)| (id, info.clone()))
+                .collect::<Vec<_>>()
+        });
         let mut peers = register
             .into_par_iter()
             .filter(|(_id, info)| {
@@ -486,7 +503,17 @@ impl WebUI {
     async fn peers_overview_ext(
         state: State<ApiState>,
     ) -> Result<Html<String>, String> {
-        let register = state.ingress_register.cloned_info();
+        let register = state.ingress_register.with_info(|all| {
+            all.iter()
+                .filter(|(_, info)| {
+                    matches!(
+                        info.ingress_type,
+                        Some(IngressType::BgpViaBmp | IngressType::Bgp)
+                    )
+                })
+                .map(|(&id, info)| (id, info.clone()))
+                .collect::<Vec<_>>()
+        });
         let s = state.store.load();
         let Some(ref store) = *s else {
             return Err("store not ready".into());
@@ -747,40 +774,56 @@ impl WebUI {
         Path((ingress_a, ingress_b)): Path<(IngressId, IngressId)>,
         state: State<ApiState>,
     ) -> Result<Html<String>, String> {
-        let register = state.ingress_register.cloned_info();
+        let (bmp_a, bmp_b, sessions_a, sessions_b) =
+            state.ingress_register.with_info(|register| {
+                let Some(bmp_a) = register
+                    .get(&ingress_a)
+                    .filter(|info| {
+                        info.ingress_type
+                            == Some(crate::ingress::IngressType::Bmp)
+                    })
+                    .map(|info| BmpRouter::new(ingress_a, info.clone()))
+                else {
+                    return Err(format!(
+                        "no (BMP) ingress with id {ingress_a}"
+                    ));
+                };
 
-        let Some(bmp_a) = register
-            .get(&ingress_a)
-            .filter(|info| {
-                info.ingress_type == Some(crate::ingress::IngressType::Bmp)
-            })
-            .map(|info| BmpRouter::new(ingress_a, info.clone()))
-        else {
-            return Err(format!("no (BMP) ingress with id {ingress_a}"));
-        };
+                let Some(bmp_b) = register
+                    .get(&ingress_b)
+                    .filter(|info| {
+                        info.ingress_type
+                            == Some(crate::ingress::IngressType::Bmp)
+                    })
+                    .map(|info| BmpRouter::new(ingress_b, info.clone()))
+                else {
+                    return Err(format!(
+                        "no (BMP) ingress with id {ingress_b}"
+                    ));
+                };
 
-        let Some(bmp_b) = register
-            .get(&ingress_b)
-            .filter(|info| {
-                info.ingress_type == Some(crate::ingress::IngressType::Bmp)
-            })
-            .map(|info| BmpRouter::new(ingress_b, info.clone()))
-        else {
-            return Err(format!("no (BMP) ingress with id {ingress_b}"));
-        };
+                let sessions_a: BTreeSet<_> = register
+                    .iter()
+                    .filter(|(_id, info)| {
+                        info.parent_ingress == Some(ingress_a)
+                    })
+                    .filter_map(|(_id, info)| {
+                        info.remote_asn.zip(info.remote_addr)
+                    })
+                    .collect();
 
-        let sessions_a: BTreeSet<_> = register
-            .iter()
-            .filter(|(_id, info)| info.parent_ingress == Some(ingress_a))
-            .filter_map(|(_id, info)| info.remote_asn.zip(info.remote_addr))
-            .collect();
+                let sessions_b: BTreeSet<_> = register
+                    .iter()
+                    .filter(|(_id, info)| {
+                        info.parent_ingress == Some(ingress_b)
+                    })
+                    .filter_map(|(_id, info)| {
+                        info.remote_asn.zip(info.remote_addr)
+                    })
+                    .collect();
 
-        let sessions_b: BTreeSet<_> = register
-            .iter()
-            .filter(|(_id, info)| info.parent_ingress == Some(ingress_b))
-            .filter_map(|(_id, info)| info.remote_asn.zip(info.remote_addr))
-            .collect();
-
+                Ok((bmp_a, bmp_b, sessions_a, sessions_b))
+            })?;
         let mut peers_diff = PeersDiff::new(bmp_a, bmp_b);
         peers_diff.only_a =
             sessions_a.difference(&sessions_b).cloned().collect();

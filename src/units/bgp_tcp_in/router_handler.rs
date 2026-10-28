@@ -913,17 +913,20 @@ impl Processor {
             // Plain NLRI store under the session's mui; ADD-PATH NLRI under
             // the per-(session, path_id) child mui so several paths for one
             // prefix from one peer coexist in the RIB.
-            let effective_id = match path_id {
-                None => ingress_id,
-                Some(pid) => self.get_or_create_path_child(ingress_id, pid),
-            };
-            payloads.push(Payload::with_received(
-                rr,
-                None,
-                received,
-                effective_id,
-                RouteStatus::Active,
-            ));
+            let reservation = path_id
+                .map(|pid| self.get_or_create_path_child(ingress_id, pid));
+            let effective_id =
+                reservation.as_ref().map_or(ingress_id, |r| r.ingress_id());
+            payloads.push(
+                Payload::with_received(
+                    rr,
+                    None,
+                    received,
+                    effective_id,
+                    RouteStatus::Active,
+                )
+                .with_path_child_use(reservation),
+            );
         }
 
         for (rr, path_id) in rr_unreach {
@@ -964,13 +967,13 @@ impl Processor {
         &mut self,
         session_id: ingress::IngressId,
         path_id: PathId,
-    ) -> ingress::IngressId {
+    ) -> ingress::register::PathChildUse {
         if let Some(&child_id) = self.path_children.get(&path_id) {
-            if self
+            if let Some(reservation) = self
                 .ingresses
-                .refresh_path_child(child_id, session_id, path_id.0)
+                .reserve_path_child(child_id, session_id, path_id.0)
             {
-                return child_id;
+                return reservation;
             }
             self.path_children.remove(&path_id);
         }
@@ -1023,7 +1026,9 @@ impl Processor {
             }
         }
 
-        child_id
+        self.ingresses
+            .reserve_path_child(child_id, session_id, path_id.0)
+            .expect("new path-child is registered and connected")
     }
 }
 
@@ -1306,12 +1311,16 @@ mod path_child_lifecycle_tests {
         let (mut processor, _gate) =
             Processor::mock(BgpTcpIn::mock("dummy", Asn::from_u32(12345)));
         let session = processor.ingresses.register();
-        let old = processor.get_or_create_path_child(session, PathId(77));
+        let old = processor
+            .get_or_create_path_child(session, PathId(77))
+            .ingress_id();
         // Retired (it owned no record), then announced again before the GC:
         // the cached child is reactivated.
         assert!(processor.ingresses.retire_empty_path_child(old));
         assert_eq!(
-            processor.get_or_create_path_child(session, PathId(77)),
+            processor
+                .get_or_create_path_child(session, PathId(77))
+                .ingress_id(),
             old
         );
         assert_eq!(
@@ -1321,7 +1330,9 @@ mod path_child_lifecycle_tests {
         // Retired again and reclaimed by the GC: the next one is fresh.
         assert!(processor.ingresses.retire_empty_path_child(old));
         processor.ingresses.remove_if_disconnected(old).unwrap();
-        let next = processor.get_or_create_path_child(session, PathId(77));
+        let next = processor
+            .get_or_create_path_child(session, PathId(77))
+            .ingress_id();
         assert_ne!(old, next);
         assert_eq!(processor.ingresses.get(next).unwrap().path_id, Some(77));
     }

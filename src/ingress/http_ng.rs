@@ -10,7 +10,7 @@ use serde::Deserialize;
 use crate::{
     http_ng::{Api, ApiError, ApiState},
     ingress::{register::IngressState, IngressId, IngressInfo, IngressType},
-    representation::{Json, OutputFormat},
+    representation::OutputFormat,
     roto_runtime::types::PeerRibType,
 };
 
@@ -45,20 +45,26 @@ impl IngressApi {
         state: State<ApiState>,
     ) -> Result<impl IntoResponse, ApiError> {
         let format = filter.format;
-        let body = match format {
-            OutputFormat::Json => {
-                let mut raw = String::from("{\"data\":").into_bytes();
-                let _ = state
-                    .ingress_register
-                    .search_and_output(filter, Json(&mut raw));
-                raw.push(b'}');
-                raw
+        use crate::http_ng::StreamResponseWriter;
+        use std::io::Write;
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let mut writer = StreamResponseWriter::new(tx, handle);
+            if state
+                .ingress_register
+                .write_search(filter, &mut writer)
+                .is_ok()
+            {
+                let _ = writer.flush();
             }
-            OutputFormat::Jsonl => {
-                state.ingress_register.search_jsonl(filter)
-            }
-        };
-        Ok(([("content-type", format.content_type())], body))
+        });
+        Ok((
+            [("content-type", format.content_type())],
+            axum::body::Body::from_stream(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            ),
+        ))
     }
 }
 
@@ -115,5 +121,55 @@ impl QueryFilter {
             return false;
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn ingress_http_stream_preserves_bytes_and_content_types() {
+        let register = Arc::new(crate::ingress::Register::new());
+        for n in 0..500 {
+            let id = register.register();
+            register.update_info(
+                id,
+                IngressInfo::new()
+                    .with_name(format!("router {n} {}", "x".repeat(2048)))
+                    .with_ingress_type(IngressType::Bmp),
+            );
+        }
+        let state = ApiState {
+            store: Default::default(),
+            ingress_register: register.clone(),
+            metrics: Default::default(),
+            daemon_info: Default::default(),
+        };
+        for format in [OutputFormat::Json, OutputFormat::Jsonl] {
+            let filter = QueryFilter {
+                format,
+                ..Default::default()
+            };
+            let mut expected = Vec::new();
+            assert!(register
+                .write_search(filter.clone(), &mut expected)
+                .is_ok());
+            let response =
+                IngressApi::ingresses(Query(filter), State(state.clone()))
+                    .await
+                    .map_err(|_| ())
+                    .unwrap()
+                    .into_response();
+            assert_eq!(
+                response.headers()["content-type"],
+                format.content_type()
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(body.as_ref(), expected);
+        }
     }
 }

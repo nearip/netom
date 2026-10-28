@@ -485,7 +485,9 @@ fn addpath_cached_child_reactivation_and_teardown_after_gc() {
     let res = processor.process_msg(Instant::now(), announce(), None);
     let old = child_id(&res);
     assert!(register.retire_empty_path_child(old));
-    let res = res.next_state.process_msg(Instant::now(), announce(), None);
+    let state = res.next_state;
+    drop(res.message_type);
+    let res = state.process_msg(Instant::now(), announce(), None);
     assert_eq!(child_id(&res), old);
     assert_eq!(
         register.get(old).unwrap().state,
@@ -495,15 +497,19 @@ fn addpath_cached_child_reactivation_and_teardown_after_gc() {
     // Retired again: a later announcement would refresh it, but this
     // test now lets the GC remove it.
     register.mark_disconnected(old);
+    let state = res.next_state;
+    drop(res.message_type);
     register.remove_if_disconnected(old).unwrap();
-    let res = res.next_state.process_msg(Instant::now(), announce(), None);
+    let res = state.process_msg(Instant::now(), announce(), None);
     let fresh = child_id(&res);
     assert_ne!(fresh, old);
     assert_eq!(register.get(fresh).unwrap().path_id, Some(77));
     // Teardown must not recreate a child removed by GC but still cached.
     register.mark_disconnected(fresh);
+    let state = res.next_state;
+    drop(res.message_type);
     register.remove_if_disconnected(fresh).unwrap();
-    let _res = res.next_state.process_msg(
+    let _res = state.process_msg(
         Instant::now(),
         mk_peer_down_notification_msg(&pph),
         None,
@@ -548,7 +554,11 @@ fn a_new_session_never_rebinds_a_previous_sessions_path_child() {
     let first = child_id(&res);
     let res = res
         .next_state
-        .process_msg(Instant::now(), mk_peer_down_notification_msg(&pph), None)
+        .process_msg(
+            Instant::now(),
+            mk_peer_down_notification_msg(&pph),
+            None,
+        )
         .next_state
         .process_msg(
             Instant::now(),
@@ -564,6 +574,162 @@ fn a_new_session_never_rebinds_a_previous_sessions_path_child() {
     let second = child_id(&res);
     assert_ne!(second, first, "path id 77 of the new session is a new path");
     assert_eq!(register.get(second).unwrap().path_id, Some(77));
+}
+
+async fn apply_to_rib(
+    runner: &crate::units::rib_unit::unit::RibUnitRunner,
+    result: ProcessingResult,
+) -> BmpState {
+    match result.message_type {
+        MessageType::RoutingUpdate { update, .. } => {
+            runner.process_update(update).await.unwrap();
+        }
+        MessageType::Other | MessageType::StateTransition => {}
+        message => panic!("unexpected BMP result: {message:?}"),
+    }
+    result.next_state
+}
+
+#[tokio::test]
+async fn pending_addpath_announcement_survives_gc() {
+    use crate::units::rib_unit::unit::RibUnitRunner;
+    use std::collections::HashSet;
+
+    let (runner, _agent) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let register = &rib.ingress_register;
+    let pph = mk_per_peer_header("127.0.0.1", 12345);
+    let mut state = mk_test_processor_with_register(register)
+        .process_msg(
+            Instant::now(),
+            mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC),
+            None,
+        )
+        .next_state
+        .process_msg(
+            Instant::now(),
+            mk_addpath_peer_up_notification_msg(&pph),
+            None,
+        )
+        .next_state;
+    for _ in 0..10 {
+        let initial = state.process_msg(
+            Instant::now(),
+            mk_addpath_v4_route_monitoring_msg(&pph, &[77]),
+            None,
+        );
+        let (child, route) = match &initial.message_type {
+            MessageType::RoutingUpdate {
+                update: Update::Bulk(p),
+                ..
+            } => (p[0].ingress_id, p[0].rx_value.clone()),
+            _ => panic!("expected announcement"),
+        };
+        state = apply_to_rib(&runner, initial).await;
+        // Resolve a future announcement before applying an earlier withdrawal.
+        let pending = state.process_msg(
+            Instant::now(),
+            mk_addpath_v4_route_monitoring_msg(&pph, &[77]),
+            None,
+        );
+        rib.insert(
+            &route,
+            rotonda_store::prefix_record::RouteStatus::Withdrawn,
+            0,
+            child,
+            false,
+            false,
+        )
+        .unwrap();
+        let prev = rib.gc_disconnected_bmp_peers(HashSet::new());
+        rib.gc_disconnected_bmp_peers(prev);
+        assert!(register.get(child).is_some(), "pending child reclaimed");
+        state = apply_to_rib(&runner, pending).await;
+        let prev = rib.gc_disconnected_bmp_peers(HashSet::new());
+        rib.gc_disconnected_bmp_peers(prev);
+        assert_eq!(rib.path_child_record_count(child), 1);
+        assert_eq!(rib.store().unwrap().routes_count().in_memory(), 1);
+        assert!(register.get(child).is_some());
+    }
+}
+
+#[tokio::test]
+async fn bmp_redump_after_flap_does_not_keep_previous_path_records() {
+    use crate::units::rib_unit::unit::RibUnitRunner;
+
+    for (retain, addpath) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let (runner, _agent) =
+            RibUnitRunner::mock_with_retain_withdrawn_attributes(retain)
+                .unwrap();
+        let rib = runner.rib();
+        let pph = mk_per_peer_header("127.0.0.1", 12345);
+        let mut state =
+            mk_test_processor_with_register(&rib.ingress_register)
+                .process_msg(
+                    Instant::now(),
+                    mk_initiation_msg(
+                        TEST_ROUTER_SYS_NAME,
+                        TEST_ROUTER_SYS_DESC,
+                    ),
+                    None,
+                )
+                .next_state;
+        for _ in 0..3 {
+            state = apply_to_rib(
+                &runner,
+                state.process_msg(
+                    Instant::now(),
+                    if addpath {
+                        mk_addpath_peer_up_notification_msg(&pph)
+                    } else {
+                        mk_peer_up_notification_msg(&pph, false).0
+                    },
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(
+                rib.store().unwrap().routes_count().in_memory(),
+                0,
+                "previous session's records survived Peer Up"
+            );
+            state = apply_to_rib(
+                &runner,
+                state.process_msg(
+                    Instant::now(),
+                    if addpath {
+                        mk_addpath_v4_route_monitoring_msg(&pph, &[1, 2])
+                    } else {
+                        mk_route_monitoring_msg(&pph)
+                    },
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(
+                rib.store().unwrap().routes_count().in_memory(),
+                if addpath { 2 } else { 1 }
+            );
+            state = apply_to_rib(
+                &runner,
+                state.process_msg(
+                    Instant::now(),
+                    mk_peer_down_notification_msg(&pph),
+                    None,
+                ),
+            )
+            .await;
+            if addpath {
+                assert_eq!(
+                    rib.store().unwrap().routes_count().in_memory(),
+                    0,
+                    "previous session's path records survived Peer Down"
+                );
+            }
+        }
+    }
 }
 
 #[test]

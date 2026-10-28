@@ -12,7 +12,7 @@ use paste::paste;
 use routecore::bgp::message::open::Capabilities;
 use routecore::bmp::message::{PeerType, RibType};
 use std::fmt;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use crate::genoutput_json;
 use crate::ingress::http_ng::QueryFilter;
@@ -35,6 +35,39 @@ pub struct Register {
 
 pub type IngressId = u32;
 
+/// Keeps a resolved path-child registered until every copy of its payload
+/// has been applied or discarded. Clones share one reservation.
+#[derive(Clone, Debug)]
+pub struct PathChildUse(Arc<PendingPathChildUse>);
+
+impl PathChildUse {
+    pub fn ingress_id(&self) -> IngressId {
+        self.0.ingress_id
+    }
+}
+
+struct PendingPathChildUse {
+    register: Arc<Register>,
+    ingress_id: IngressId,
+}
+
+impl fmt::Debug for PendingPathChildUse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("PathChildUse")
+            .field(&self.ingress_id)
+            .finish()
+    }
+}
+
+impl Drop for PendingPathChildUse {
+    fn drop(&mut self) {
+        let mut lock = self.register.info.write().unwrap();
+        if let Some(info) = lock.get_mut(&self.ingress_id) {
+            info.pending_path_uses -= 1;
+        }
+    }
+}
+
 /// Breakdown of the ingress register by entry state, for memory reporting.
 /// Produced by [`Register::memory_summary`].
 #[derive(Debug, Default, Clone, Copy)]
@@ -47,6 +80,7 @@ pub struct RegisterMemSummary {
     pub bgp_via_bmp: usize,
     /// ADD-PATH path-child entries (`IngressType::BgpPath`).
     pub bgp_path: usize,
+    pub pending_path_uses: usize,
 }
 
 #[derive(serde::Serialize)]
@@ -171,7 +205,7 @@ macro_rules! info_for_field{
         /// is wrapped as an `Option`, giving the user (mostly connector/ingress
         /// components within Netom) the flexibilty to fill in what makes sense in
         /// their specific case.
-        #[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
+        #[derive(Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
         #[serde_with::skip_serializing_none]
         #[derive(serde::Serialize)]
         pub struct $name {
@@ -183,12 +217,30 @@ macro_rules! info_for_field{
             // Internal generation for path-child activity; not exposed in APIs.
             #[serde(skip)]
             pub(crate) path_activity: u64,
+            // Protected by the register write lock, together with GC's
+            // disconnected check and removal.
+            #[serde(skip)]
+            pub(crate) pending_path_uses: usize,
             // Stable across exporter cache eviction; changes when an ingress
             // is claimed for a new connection. Scoped to this process.
             #[serde(skip)]
             pub(crate) history_generation: u64,
             #[serde(skip)]
             pub(crate) history_revision: u64,
+        }
+
+        impl Clone for $name {
+            fn clone(&self) -> Self {
+                #[cfg(test)]
+                crate::tests::allocations::ingress_clone();
+                Self {
+                    $($field: self.$field.clone(),)*
+                    path_activity: self.path_activity,
+                    pending_path_uses: self.pending_path_uses,
+                    history_generation: self.history_generation,
+                    history_revision: self.history_revision,
+                }
+            }
         }
 
         impl $name {
@@ -291,8 +343,23 @@ impl Register {
         res
     }
 
+    /// Inspect the register synchronously without copying its entries. Keep
+    /// the callback short; do not perform I/O or acquire RIB locks in it.
+    pub fn with_info<T>(
+        &self,
+        visit: impl FnOnce(&HashMap<IngressId, IngressInfo>) -> T,
+    ) -> T {
+        visit(&self.info.read().unwrap())
+    }
+
+    #[cfg(test)]
     pub fn cloned_info(&self) -> HashMap<IngressId, IngressInfo> {
         self.info.read().unwrap().clone()
+    }
+
+    /// Test registration without cloning the ingress's display fields.
+    pub fn contains(&self, id: IngressId) -> bool {
+        self.info.read().unwrap().contains_key(&id)
     }
 
     /// Drop entries of a caller's `… -> IngressId` map whose id no longer
@@ -361,6 +428,7 @@ impl Register {
             ..Default::default()
         };
         for info in lock.values() {
+            s.pending_path_uses += info.pending_path_uses;
             match info.state {
                 Some(IngressState::Connected) => s.connected += 1,
                 Some(IngressState::Disconnected) => s.disconnected += 1,
@@ -525,22 +593,56 @@ impl Register {
             .map(|info| (id, info.clone()).into())
     }
 
-    /// Filter all ingresses and emit one JSON object per line (JSONL/NDJSON).
-    ///
-    /// The returned buffer ends with a trailing newline after the last record,
-    /// which is the conventional shape for `application/x-ndjson`.
-    pub fn search_jsonl(&self, filter: QueryFilter) -> Vec<u8> {
-        let mut out = Vec::new();
-        let lock = self.info.read().unwrap();
-        for (&ingress_id, ingress_info) in
-            lock.iter().filter(|(_, info)| filter.filter(info))
-        {
-            let entry = IdAndInfo::from((ingress_id, ingress_info));
-            if serde_json::to_writer(&mut out, &entry).is_ok() {
-                out.push(b'\n');
-            }
+    /// Stream in the register's existing iteration order. Only the IDs are
+    /// snapshotted; each record is serialized while borrowed, then the lock is
+    /// released before writing to the potentially network-paced target.
+    pub fn write_search<W: std::io::Write>(
+        &self,
+        filter: QueryFilter,
+        target: &mut W,
+    ) -> Result<(), OutputError> {
+        use crate::representation::OutputFormat;
+        let ids: Vec<_> = self.with_info(|info| {
+            info.iter()
+                .filter(|(_, i)| filter.filter(i))
+                .map(|(&id, _)| id)
+                .collect()
+        });
+        let json = filter.format == OutputFormat::Json;
+        if json {
+            target.write_all(b"{\"data\":[")?;
         }
-        out
+        let mut first = true;
+        let mut line = Vec::new();
+        for id in ids {
+            line.clear();
+            let found = self.with_info(|info| {
+                if let Some(info) = info.get(&id) {
+                    serde_json::to_writer(
+                        &mut line,
+                        &IdAndInfo::from((id, info)),
+                    )?;
+                    Ok::<_, serde_json::Error>(true)
+                } else {
+                    Ok(false)
+                }
+            })?;
+            if !found {
+                continue;
+            }
+            if json && !first {
+                target.write_all(b",")?;
+            }
+            target.write_all(&line)?;
+            if !json {
+                target.write_all(b"\n")?;
+            }
+            first = false;
+        }
+        if json {
+            target.write_all(b"]}")?;
+        }
+        Ok(())
     }
 
     /// Filter all ingresses based on a passed filter and return them
@@ -570,18 +672,25 @@ impl Register {
         for<'a> IdAndInfo<'a>: GenOutput<T>,
     {
         IdAndInfo::write_seq_start(&mut target)?;
-        let lock = self.info.read().unwrap();
-
-        let mut iter = lock.iter().filter(|(_, info)| filter.filter(info));
-
-        if let Some((&ingress_id, ingress_info)) = iter.next() {
-            let _ = IdAndInfo::from((ingress_id, ingress_info))
-                .write(&mut target);
-        }
-
-        for (&ingress_id, ingress_info) in iter {
-            IdAndInfo::write_seq_sep(&mut target)?;
-            IdAndInfo::from((ingress_id, ingress_info)).write(&mut target)?;
+        let ids: Vec<_> = self.with_info(|all| {
+            all.iter()
+                .filter(|(_, info)| filter.filter(info))
+                .map(|(&id, _)| id)
+                .collect()
+        });
+        let mut first = true;
+        for id in ids {
+            let Some(info) = self.get(id) else {
+                continue;
+            };
+            if !first {
+                IdAndInfo::write_seq_sep(&mut target)?;
+            }
+            let result = IdAndInfo::from((id, &info)).write(&mut target);
+            if !first {
+                result?;
+            }
+            first = false;
         }
 
         IdAndInfo::write_seq_end(&mut target)?;
@@ -599,8 +708,8 @@ impl Register {
     /// Remove an ingress entry only if it is currently `Disconnected`.
     ///
     /// Returns the removed [`IngressInfo`] when the entry was present and in
-    /// the `Disconnected` state, or `None` if it was absent or in any other
-    /// state. The state check and the removal happen under a single write
+    /// the `Disconnected` state with no pending path users, or `None`
+    /// otherwise. The pending-use check, state check and removal share a write
     /// lock, so this is the safe reclaim step for a snapshot-then-remove GC
     /// sweep: a peer that reconnected and flipped its id back to `Connected`
     /// in the window since the snapshot is left untouched, rather than having
@@ -611,7 +720,10 @@ impl Register {
     ) -> Option<IngressInfo> {
         let mut lock = self.info.write().unwrap();
         match lock.get(&id) {
-            Some(info) if info.state == Some(IngressState::Disconnected) => {
+            Some(info)
+                if info.state == Some(IngressState::Disconnected)
+                    && info.pending_path_uses == 0 =>
+            {
                 lock.remove(&id)
             }
             _ => None,
@@ -688,7 +800,7 @@ impl Register {
     /// longer registered.
     ///
     /// The RIB unit runs behind the BMP unit, which refreshes a cached
-    /// child when it explodes an announcement (`refresh_path_child`). When
+    /// child when it explodes an announcement (`reserve_path_child`). When
     /// a withdrawal that empties the child and an announcement under the
     /// same path id are exploded back to back, that refresh lands before
     /// the RIB retires the child, and only the RIB, when it then adds the
@@ -730,6 +842,32 @@ impl Register {
         info.path_activity = info.path_activity.saturating_add(1);
         info.state = Some(IngressState::Connected);
         true
+    }
+
+    /// Validate, refresh and reserve a cached child under the same lock
+    /// used by GC. No disconnected child can disappear between resolution
+    /// and the payload's eventual insertion and record accounting.
+    pub fn reserve_path_child(
+        self: &Arc<Self>,
+        id: IngressId,
+        parent: IngressId,
+        path_id: u32,
+    ) -> Option<PathChildUse> {
+        let mut lock = self.info.write().unwrap();
+        let info = lock.get_mut(&id)?;
+        if info.ingress_type != Some(IngressType::BgpPath)
+            || info.parent_ingress != Some(parent)
+            || info.path_id != Some(path_id)
+        {
+            return None;
+        }
+        info.pending_path_uses += 1;
+        info.path_activity = info.path_activity.saturating_add(1);
+        info.state = Some(IngressState::Connected);
+        Some(PathChildUse(Arc::new(PendingPathChildUse {
+            register: self.clone(),
+            ingress_id: id,
+        })))
     }
 
     /// Find all [`IngressId`]s that are children of the given `parent`
@@ -1089,8 +1227,143 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_ingress_stream_matches_legacy_bytes_without_buffering_body() {
+        use crate::{
+            representation::OutputFormat, tests::allocations::measure,
+        };
+        let register = Register::new();
+        for n in 0..4096 {
+            let id = register.register();
+            register.update_info(
+                id,
+                IngressInfo::new()
+                    .with_name(format!("peer {n} \"\\\n{}", "x".repeat(2048)))
+                    .with_ingress_type(IngressType::Bgp)
+                    .with_remote_asn(Asn::from_u32(64500 + n % 2)),
+            );
+        }
+        for format in [OutputFormat::Json, OutputFormat::Jsonl] {
+            for remote_asn in
+                [None, Some(Asn::from_u32(64500)), Some(Asn::from_u32(1))]
+            {
+                let filter = QueryFilter {
+                    format,
+                    remote_asn,
+                    ..Default::default()
+                };
+                let (expected, before) = measure(|| {
+                    let mut out = Vec::new();
+                    if format == OutputFormat::Json {
+                        out.extend_from_slice(b"{\"data\":");
+                        register.with_info(|all| {
+                            out.push(b'[');
+                            let mut first = true;
+                            for (&id, info) in all
+                                .iter()
+                                .filter(|(_, info)| filter.filter(info))
+                            {
+                                if !first {
+                                    out.push(b',');
+                                }
+                                serde_json::to_writer(
+                                    &mut out,
+                                    &IdAndInfo::from((id, info)),
+                                )
+                                .unwrap();
+                                first = false;
+                            }
+                            out.push(b']');
+                        });
+                        out.push(b'}');
+                    } else {
+                        register.with_info(|all| {
+                            for (&id, info) in all
+                                .iter()
+                                .filter(|(_, info)| filter.filter(info))
+                            {
+                                serde_json::to_writer(
+                                    &mut out,
+                                    &IdAndInfo::from((id, info)),
+                                )
+                                .unwrap();
+                                out.push(b'\n');
+                            }
+                        });
+                    }
+                    out
+                });
+                struct Compare<'a> {
+                    register: &'a Register,
+                    remaining: &'a [u8],
+                }
+                impl std::io::Write for Compare<'_> {
+                    fn write(
+                        &mut self,
+                        bytes: &[u8],
+                    ) -> std::io::Result<usize> {
+                        // Any lock held during a downstream write is a regression.
+                        assert!(self.register.info.try_write().is_ok());
+                        assert!(self.remaining.starts_with(bytes));
+                        self.remaining = &self.remaining[bytes.len()..];
+                        Ok(bytes.len())
+                    }
+                    fn flush(&mut self) -> std::io::Result<()> {
+                        Ok(())
+                    }
+                }
+                let mut target = Compare {
+                    register: &register,
+                    remaining: &expected,
+                };
+                let (_, after) = measure(|| {
+                    register
+                        .write_search(filter.clone(), &mut target)
+                        .map_err(|_| ())
+                        .unwrap()
+                });
+                assert!(target.remaining.is_empty());
+                assert_eq!(after.ingress_clones, 0);
+                if remote_asn.is_none() {
+                    assert!(after.peak_bytes < before.peak_bytes / 20);
+                    eprintln!("ingress {format:?}: body={} bytes; peak {} -> {} bytes; clones={}",
+                        expected.len(), before.peak_bytes, after.peak_bytes, after.ingress_clones);
+                }
+            }
+        }
+    }
 
     use super::*;
+
+    #[test]
+    fn pending_path_use_blocks_gc_until_the_last_payload_copy_is_dropped() {
+        let reg = Arc::new(Register::new());
+        let parent = reg.register();
+        let child = reg.register();
+        reg.update_info(
+            child,
+            IngressInfo::new()
+                .with_ingress_type(IngressType::BgpPath)
+                .with_parent_ingress(parent)
+                .with_path_id(77u32)
+                .with_state(IngressState::Connected),
+        );
+        assert!(reg.reserve_path_child(child, parent, 88).is_none());
+        let pending = reg.reserve_path_child(child, parent, 77).unwrap();
+        let copy = pending.clone();
+        let another = reg.reserve_path_child(child, parent, 77).unwrap();
+        assert_eq!(reg.memory_summary().pending_path_uses, 2);
+        assert!(reg.retire_empty_path_child(child));
+        assert!(reg.remove_if_disconnected(child).is_none());
+        drop(pending);
+        drop(another);
+        assert_eq!(reg.memory_summary().pending_path_uses, 1);
+        assert!(reg.remove_if_disconnected(child).is_none());
+        drop(copy);
+        assert_eq!(reg.memory_summary().pending_path_uses, 0);
+        assert!(reg.remove_if_disconnected(child).is_some());
+        assert!(reg.reserve_path_child(child, parent, 77).is_none());
+    }
 
     #[test]
     fn builder_and_update() {
@@ -1102,7 +1375,8 @@ mod tests {
         res.update_info(id, info.clone());
         assert_eq!(res.get(id), Some(info));
 
-        let mut newinfo = IngressInfo::new().with_local_asn(Asn::from_u32(65537));
+        let mut newinfo =
+            IngressInfo::new().with_local_asn(Asn::from_u32(65537));
         res.update_info(id, newinfo.clone());
         newinfo.history_revision = 1;
         assert_eq!(res.get(id), Some(newinfo));

@@ -2925,7 +2925,7 @@ dependencies = [
 [[package]]
 name = "rotonda-store"
 version = "0.5.1-dev"
-source = "git+https://github.com/nearip/netom-store.git?rev=21d317b30d5102c9941cbb7cca423f52cc4b8a08#21d317b30d5102c9941cbb7cca423f52cc4b8a08"
+source = "git+https://github.com/nearip/netom-store.git?rev=de77e5f7448e873388dc985ad814a00a9c47bea4#de77e5f7448e873388dc985ad814a00a9c47bea4"
 dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",

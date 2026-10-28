@@ -274,7 +274,7 @@ impl PeerAware for Updating {
         pph: &PerPeerHeader<Bytes>,
         path_id: routecore::bgp::nlri::common::PathId,
         register: &Arc<ingress::Register>,
-    ) -> Option<(ingress::IngressId, bool)> {
+    ) -> Option<(ingress::register::PathChildUse, bool)> {
         self.peer_states
             .get_or_create_path_child(pph, path_id, register)
     }

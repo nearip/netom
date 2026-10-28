@@ -471,7 +471,7 @@ impl RibUnitRunner {
             roto_function_vrp_update: None,
             _roto_function_post: None,
             roto_function_vrp_update_post: None,
-            ingress_register: Arc::new(ingress::Register::new()),
+            ingress_register,
             roto_context: ctx.clone(),
         };
 
@@ -547,11 +547,9 @@ impl RibUnitRunner {
         // under its peers' and path-children's ids), so there is nothing to
         // reset, and a reset walks every store: it ran on every exporter
         // reconnect, awaited by the read loop before the dump was read.
-        if self
-            .ingress_register
-            .get(ingress_id)
-            .is_some_and(|i| i.ingress_type == Some(ingress::IngressType::Bmp))
-        {
+        if self.ingress_register.get(ingress_id).is_some_and(|i| {
+            i.ingress_type == Some(ingress::IngressType::Bmp)
+        }) {
             return;
         }
         let rib = self.rib.load().clone();
@@ -847,7 +845,7 @@ impl RibUnitRunner {
         }
     }
 
-    pub(super) async fn process_update(
+    pub(crate) async fn process_update(
         &self,
         update: Update,
     ) -> Result<(), String> {
@@ -870,19 +868,19 @@ impl RibUnitRunner {
 
             Update::WithdrawBulk(ref entries) => {
                 debug!("got WithdrawBulk for {} ids", entries.len());
-                // Partition on the inline IngressInfo snapshot. `Some(info)`
-                // means a synthesized peer that bmp-in has *already* removed
-                // from the ingress register (it minted a fresh id this session
-                // and won't rebind) — gone for good, so physically reclaim its
-                // records. `None` means a Disconnected parent that may rebind
-                // via find_existing_peer and be reactivated by
-                // IngressReappeared — keep mark-withdraw so its records survive
-                // until then.
+                // Removed ingresses and session-local path-children will
+                // never rebind, so physically reclaim their records. Ordinary
+                // peers keep mark-withdraw semantics until reset or GC.
                 let mut mark: Vec<(ingress::IngressId, Option<AfiSafiType>)> =
                     Vec::new();
                 let mut remove: Vec<ingress::IngressId> = Vec::new();
                 for (id, info) in entries.iter() {
-                    if info.is_some() {
+                    if info.is_some()
+                        || self.ingress_register.is_path_child(*id)
+                    {
+                        // Path ids are session-local: the next dump mints
+                        // fresh children, so retaining these records until
+                        // GC duplicates the previous session's RIB.
                         remove.push(*id);
                     } else {
                         mark.push((*id, None));
@@ -1442,6 +1440,7 @@ impl RibUnitRunner {
                         received,
                         ingress_id,
                         route_status,
+                        path_child_use,
                     } = p;
                     let mutrr: roto_runtime::MutRotondaRoute =
                         rx_value.into();
@@ -1464,6 +1463,7 @@ impl RibUnitRunner {
                                 received,
                                 ingress_id,
                                 route_status,
+                                path_child_use,
                             };
                             self.insert_payload(&p);
                             res.push(p.clone());
@@ -1479,6 +1479,7 @@ impl RibUnitRunner {
                                 received,
                                 ingress_id,
                                 route_status,
+                                path_child_use,
                             };
                         }
                     }

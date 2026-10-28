@@ -627,7 +627,7 @@ pub trait PeerAware {
         pph: &PerPeerHeader<Bytes>,
         path_id: PathId,
         register: &Arc<ingress::Register>,
-    ) -> Option<(ingress::IngressId, bool)>;
+    ) -> Option<(ingress::register::PathChildUse, bool)>;
 
     /// Look up the existing path-child for `(peer, path_id)`. Never mints:
     /// a withdrawal for a never-announced path id has nothing to withdraw.
@@ -1416,34 +1416,40 @@ where
             // Plain NLRI store under the session's mui; ADD-PATH NLRI under
             // the per-(session, path_id) child mui so several paths for one
             // prefix from one peer coexist in the RIB.
-            let ingress_id = match path_id {
-                None => session_ingress_id,
+            let reservation = match path_id {
+                None => None,
                 Some(path_id) => match self.details.get_or_create_path_child(
                     &pph,
                     path_id,
                     &self.ingress_register,
                 ) {
-                    Some((child_id, minted)) => {
+                    Some((reservation, minted)) => {
                         if minted {
                             self.status_reporter.addpath_path_child_minted(
                                 self.router_id.clone(),
                             );
                         }
-                        child_id
+                        Some(reservation)
                     }
                     // Unreachable in practice: the session resolved above,
                     // and get_or_create only fails on an unknown peer.
-                    None => session_ingress_id,
+                    None => None,
                 },
             };
+            let ingress_id = reservation
+                .as_ref()
+                .map_or(session_ingress_id, |r| r.ingress_id());
             update_report_msg.inc_valid_announcements();
-            payloads.push(Payload::with_received(
-                rr,
-                None,
-                received,
-                ingress_id,
-                RouteStatus::Active,
-            ));
+            payloads.push(
+                Payload::with_received(
+                    rr,
+                    None,
+                    received,
+                    ingress_id,
+                    RouteStatus::Active,
+                )
+                .with_path_child_use(reservation),
+            );
         }
 
         for (rr, path_id) in rr_unreach {
@@ -2124,15 +2130,15 @@ impl PeerAware for PeerStates {
         pph: &PerPeerHeader<Bytes>,
         path_id: PathId,
         register: &Arc<ingress::Register>,
-    ) -> Option<(ingress::IngressId, bool)> {
+    ) -> Option<(ingress::register::PathChildUse, bool)> {
         let peer_state = self.0.get_mut(pph)?;
         if let Some(&id) = peer_state.path_children.get(&path_id) {
-            if register.refresh_path_child(
+            if let Some(reservation) = register.reserve_path_child(
                 id,
                 peer_state.ingress_id,
                 path_id.0,
             ) {
-                return Some((id, false));
+                return Some((reservation, false));
             }
             peer_state.path_children.remove(&path_id);
         }
@@ -2182,7 +2188,10 @@ impl PeerAware for PeerStates {
             }
         }
 
-        Some((child_id, minted))
+        let reservation = register
+            .reserve_path_child(child_id, session_id, path_id.0)
+            .expect("new path-child is registered and connected");
+        Some((reservation, minted))
     }
 
     fn get_path_child(

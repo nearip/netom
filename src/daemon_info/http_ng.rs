@@ -67,21 +67,9 @@ async fn status(
     let info = &state.daemon_info;
     let config = info.config();
 
-    let mut total = 0;
-    let mut connected = 0;
-    let mut disconnected = 0;
-    for (_id, ingress) in state.ingress_register.cloned_info() {
-        total += 1;
-        match ingress.state {
-            Some(crate::ingress::register::IngressState::Connected) => {
-                connected += 1
-            }
-            Some(crate::ingress::register::IngressState::Disconnected) => {
-                disconnected += 1
-            }
-            _ => {}
-        }
-    }
+    let summary = state.ingress_register.memory_summary();
+    let (total, connected, disconnected) =
+        (summary.total, summary.connected, summary.disconnected);
 
     let bmp = mem_stats::bmp_out_snapshot();
 

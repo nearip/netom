@@ -23,13 +23,13 @@ use rotonda_store::{
     rib::{config::MemoryOnlyConfig, StarCastRib},
     stats::UpsertReport,
 };
-use routecore::bmp::message::RibType;
 use routecore::bgp::{
     aspath::HopPath,
     nlri::afisafi::{AfiSafiNlri, IsPrefix, Nlri},
     path_attributes::PaMap,
     types::{AfiSafiType, Otc},
 };
+use routecore::bmp::message::RibType;
 use serde::{
     ser::{SerializeSeq, SerializeStruct},
     Serialize, Serializer,
@@ -279,7 +279,112 @@ pub struct StoreCounts {
     pub routes: usize,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RouteStatusCounts {
+    active: usize,
+    inactive: usize,
+    withdrawn: usize,
+}
+
+impl RouteStatusCounts {
+    fn total(&self) -> usize {
+        self.active + self.inactive + self.withdrawn
+    }
+}
+
+#[derive(Debug, Default)]
+struct StoreStatusSplit {
+    counts: RouteStatusCounts,
+    per_mui: HashMap<IngressId, RouteStatusCounts>,
+    orphan_records: usize,
+    orphan_muis: usize,
+}
+
 impl Rib {
+    /// An opt-in census of physically stored records. Account for global
+    /// session withdrawals as well as per-record status. Like the existing
+    /// memory report this is a live scan, not a transactional snapshot.
+    fn store_status_split<M: Meta>(
+        &self,
+        store: &StarCastRib<M, MemoryOnlyConfig>,
+    ) -> StoreStatusSplit {
+        let mut split = StoreStatusSplit::default();
+        for prefix in store.prefixes_keys_iter() {
+            let _ = store.get_records_for_prefix_filtered(
+                &prefix,
+                None,
+                true,
+                &mut |id, status, _| {
+                    let counts = split.per_mui.entry(id).or_default();
+                    match status {
+                        RouteStatus::Active => counts.active += 1,
+                        RouteStatus::InActive => counts.inactive += 1,
+                        RouteStatus::Withdrawn => counts.withdrawn += 1,
+                    }
+                    false
+                },
+            );
+        }
+        // The epoch guard is released before register lookups or logging.
+        for (mui, counts) in &split.per_mui {
+            split.counts.active += counts.active;
+            split.counts.inactive += counts.inactive;
+            split.counts.withdrawn += counts.withdrawn;
+            if !self.ingress_register.contains(*mui) {
+                split.orphan_records += counts.total();
+                split.orphan_muis += 1;
+            }
+        }
+        split
+    }
+
+    fn log_status_split(label: &str, split: StoreStatusSplit) {
+        use crate::mem_stats::fmt_count;
+        let total = split.counts.total();
+        let pct = if total > 0 {
+            split.counts.withdrawn as f64 * 100.0 / total as f64
+        } else {
+            0.0
+        };
+        info!(
+            "memstat: {label} route-status active={} inactive={} withdrawn={} \
+             ({pct:.1}% withdrawn) store-muis={} orphan-records={} orphan-muis={}",
+            fmt_count(split.counts.active),
+            fmt_count(split.counts.inactive),
+            fmt_count(split.counts.withdrawn),
+            fmt_count(split.per_mui.len()),
+            fmt_count(split.orphan_records),
+            fmt_count(split.orphan_muis),
+        );
+        let mut counts: Vec<_> = split.per_mui.into_iter().collect();
+        counts.sort_unstable_by(|a, b| b.1.total().cmp(&a.1.total()));
+        let over_1m =
+            counts.iter().filter(|(_, c)| c.total() > 1_000_000).count();
+        let over_100k =
+            counts.iter().filter(|(_, c)| c.total() > 100_000).count();
+        let max = counts.first().map_or(0, |(_, c)| c.total());
+        let top = counts
+            .iter()
+            .take(10)
+            .map(|(mui, c)| {
+                format!(
+                    "{mui}={}/{}/{}",
+                    fmt_count(c.active),
+                    fmt_count(c.inactive),
+                    fmt_count(c.withdrawn)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        info!(
+            "memstat: {label} per-mui max={} muis>1M={} muis>100k={} \
+             top10[mui=active/inactive/withdrawn]: {top}",
+            fmt_count(max),
+            over_1m,
+            over_100k,
+        );
+    }
+
     pub fn new(
         ingress_register: Arc<ingress::Register>,
         roto_package: Option<Arc<RotoPackage>>,
@@ -445,7 +550,7 @@ impl Rib {
         let reg = self.ingress_register.memory_summary();
         info!(
             "memstat: ingress total={} connected={} disconnected={} \
-             non_network={} unset={} (BgpViaBmp {}, BgpPath {})",
+             non_network={} unset={} (BgpViaBmp {}, BgpPath {}) pending-path-uses={}",
             reg.total,
             reg.connected,
             reg.disconnected,
@@ -453,42 +558,41 @@ impl Rib {
             reg.state_unset,
             reg.bgp_via_bmp,
             reg.bgp_path,
+            reg.pending_path_uses,
         );
 
-        // Optional Active/Withdrawn split of the per-(prefix, mui) route
-        // slots. `routes/variants` counts every physically-resident slot
-        // regardless of status, so a runaway count with flat prefixes is
-        // either (a) Withdrawn slots retained under still-live peers — a
-        // mark-withdrawn graveyard that only whole-mui removal reclaims — or
-        // (b) slots under muis that have left the ingress register entirely
-        // and so are invisible to the Disconnected-only GC. The withdrawn %
-        // distinguishes status; `store-muis` vs the `ingress total` line
-        // above distinguishes (a) (roughly equal) from (b) (store-muis far
-        // larger).
-        //
-        // This walks every record in the store (cost ~ a full RIB dump, and
-        // it pins epoch garbage for the whole walk), so it only runs when the
-        // rib unit's `memstat_status_split` config flag is on (hot-reloadable;
-        // off by default). Leave it off for normal operation.
+        // Opt-in full record census. It is hot-reloadable and disabled by
+        // default because it visits the whole table. Each prefix is borrowed
+        // under a short-lived guard. Report actual
+        // missing owners rather than comparing unrelated population sizes.
         if status_split {
             if let Some(store) = self.flowspec.as_ref() {
-                let guard = &epoch::pin();
                 let mut rules = 0usize;
                 let mut rule_bytes = 0usize;
                 let mut per_mui: HashMap<u32, usize> = HashMap::new();
-                for pr in store.prefixes_iter(guard).flatten() {
-                    for r in pr.meta.iter() {
-                        let n = r.meta.rule_count();
-                        rules += n;
-                        rule_bytes += r.meta.byte_size();
-                        *per_mui.entry(r.multi_uniq_id).or_insert(0) += n;
-                    }
+                for prefix in store.prefixes_keys_iter() {
+                    let _ = store.get_records_for_prefix_filtered(
+                        &prefix,
+                        None,
+                        true,
+                        &mut |id, _, meta| {
+                            let n = meta.rule_count();
+                            rules += n;
+                            rule_bytes += meta.byte_size();
+                            *per_mui.entry(id).or_insert(0) += n;
+                            false
+                        },
+                    );
                 }
                 info!(
                     "memstat: flowspec rules={} blob-bytes={} store-muis={}",
                     fmt_count(rules),
                     fmt_bytes(rule_bytes),
                     fmt_count(per_mui.len()),
+                );
+                Self::log_status_split(
+                    "flowspec",
+                    self.store_status_split(store),
                 );
             }
             for (label, store) in [
@@ -498,66 +602,7 @@ impl Rib {
                 let Some(store) = store else {
                     continue;
                 };
-                let guard = &epoch::pin();
-                let mut active = 0usize;
-                let mut withdrawn = 0usize;
-                // Per-mui total slot count (active + withdrawn), so a runaway
-                // count can be attributed to the fattest sessions. The key
-                // (mui == ingress_id) cross-references the /ingresses API to a
-                // concrete (router, peer, pre/post) — use it to target which
-                // sessions to stop monitoring or filter.
-                let mut per_mui: HashMap<u32, usize> = HashMap::new();
-                for pr in store.prefixes_iter(guard).flatten() {
-                    for r in pr.meta.iter() {
-                        *per_mui.entry(r.multi_uniq_id).or_insert(0) += 1;
-                        if r.status == RouteStatus::Withdrawn {
-                            withdrawn += 1;
-                        } else {
-                            active += 1;
-                        }
-                    }
-                }
-                let total = active + withdrawn;
-                let pct = if total > 0 {
-                    withdrawn as f64 * 100.0 / total as f64
-                } else {
-                    0.0
-                };
-                info!(
-                    "memstat: {label} route-status active={} withdrawn={} \
-                     ({pct:.1}% withdrawn) store-muis={}",
-                    fmt_count(active),
-                    fmt_count(withdrawn),
-                    fmt_count(per_mui.len()),
-                );
-
-                // Per-mui route-count histogram: the top sessions by slot count
-                // plus how many muis sit above coarse thresholds. Lets a leak
-                // ("a mui past its peer's real table") be told apart from scale
-                // ("many fat full-table sessions"), and ranks filtering targets.
-                if !per_mui.is_empty() {
-                    let mut counts: Vec<(u32, usize)> =
-                        per_mui.into_iter().collect();
-                    counts.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-                    let over_1m =
-                        counts.iter().filter(|(_, c)| *c > 1_000_000).count();
-                    let over_100k =
-                        counts.iter().filter(|(_, c)| *c > 100_000).count();
-                    let max = counts.first().map(|(_, c)| *c).unwrap_or(0);
-                    let top: String = counts
-                        .iter()
-                        .take(10)
-                        .map(|(mui, c)| format!("{mui}={}", fmt_count(*c)))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    info!(
-                        "memstat: {label} per-mui max={} muis>1M={} \
-                         muis>100k={} top10[mui=routes]: {top}",
-                        fmt_count(max),
-                        over_1m,
-                        over_100k,
-                    );
-                }
+                Self::log_status_split(label, self.store_status_split(store));
             }
         }
     }
@@ -1114,13 +1159,14 @@ impl Rib {
                 gauge.sub_adj_rib_in(afi_safi, 1);
             }
 
-            // A path-child stands for one path of one session (RFC 7911): a
-            // withdrawn path is gone, so its record is removed rather than
-            // kept as a withdrawn tombstone, and the child is retired once it
-            // owns none. O(1); no walk.
-            if self.ingress_register.is_path_child(mui) {
+            // Without attribute retention, ordinary withdrawals remove their
+            // slots too: connected sessions would otherwise keep tombstones
+            // forever. A path-child is always removed (RFC 7911), and retired
+            // once it owns nothing. O(1); no walk.
+            let path_child = self.ingress_register.is_path_child(mui);
+            if path_child || !retain_withdrawn_attributes {
                 let removed = store.remove_record(prefix, mui)?;
-                if removed {
+                if removed && path_child {
                     self.path_child_record_removed(mui);
                 }
                 return Ok(UpsertReport {
@@ -1146,17 +1192,6 @@ impl Rib {
                     mui_new: false,
                     mui_count: 0,
                 });
-            }
-
-            if !retain_withdrawn_attributes {
-                let pubrec = Record::new(
-                    mui,
-                    ltime,
-                    RouteStatus::Withdrawn,
-                    RotondaPaMap::empty_path_attributes(),
-                );
-
-                return store.insert(prefix, pubrec, None);
             }
 
             // instead of creating an empty PrefixRoute for this Prefix and
@@ -1354,9 +1389,27 @@ impl Rib {
             .map(|(id, _)| *id)
             .collect();
         for (name, res) in [
-            ("unicast", (*self.unicast).as_ref().unwrap().mark_muis_as_withdrawn(&all_families)),
-            ("multicast", (*self.multicast).as_ref().unwrap().mark_muis_as_withdrawn(&all_families)),
-            ("flowspec", (*self.flowspec).as_ref().unwrap().mark_muis_as_withdrawn(&all_families)),
+            (
+                "unicast",
+                (*self.unicast)
+                    .as_ref()
+                    .unwrap()
+                    .mark_muis_as_withdrawn(&all_families),
+            ),
+            (
+                "multicast",
+                (*self.multicast)
+                    .as_ref()
+                    .unwrap()
+                    .mark_muis_as_withdrawn(&all_families),
+            ),
+            (
+                "flowspec",
+                (*self.flowspec)
+                    .as_ref()
+                    .unwrap()
+                    .mark_muis_as_withdrawn(&all_families),
+            ),
         ] {
             if let Err(e) = res {
                 error!("failed to mark MUIs as withdrawn in {name} rib: {e}");
@@ -1957,56 +2010,61 @@ impl Rib {
         &self,
         prev: HashSet<IngressId>,
     ) -> HashSet<IngressId> {
-        let info = self.ingress_register.cloned_info();
+        let (disconnected, peers, childless_routers) =
+            self.ingress_register.with_info(|info| {
+                // Every parent_ingress referenced by some entry. A router (parent)
+                // entry is only reclaimable once nothing still references it as a
+                // parent — otherwise a leftover child could still rebind to it.
+                let parents_in_use: HashSet<IngressId> =
+                    info.values().filter_map(|i| i.parent_ingress).collect();
 
-        // Every parent_ingress referenced by some entry. A router (parent)
-        // entry is only reclaimable once nothing still references it as a
-        // parent — otherwise a leftover child could still rebind to it.
-        let parents_in_use: HashSet<IngressId> =
-            info.values().filter_map(|i| i.parent_ingress).collect();
-
-        // All Disconnected ids we track across sweeps for idle-interval
-        // detection (this set becomes the next `prev`). Split into the two
-        // reclaim paths: `peers` (BgpViaBmp, carry RIB records) and
-        // `childless_routers` (Bmp parents with no remaining children). A Bmp
-        // parent that still has children is added to `disconnected` only — it
-        // stays a candidate next sweep but is not yet eligible to reclaim.
-        let mut disconnected: HashSet<IngressId> = HashSet::new();
-        let mut peers: HashSet<IngressId> = HashSet::new();
-        let mut childless_routers: HashSet<IngressId> = HashSet::new();
-        for (id, i) in &info {
-            if i.state != Some(ingress::register::IngressState::Disconnected)
-            {
-                continue;
-            }
-            match i.ingress_type {
-                Some(
-                    ingress::IngressType::BgpViaBmp
-                    | ingress::IngressType::Bgp,
-                ) => {
-                    disconnected.insert(*id);
-                    // Defer while ADD-PATH path-children still reference
-                    // this session as parent: they are reclaimed this
-                    // sweep, the session becomes eligible on the next one.
-                    if !parents_in_use.contains(id) {
-                        peers.insert(*id);
+                // All Disconnected ids we track across sweeps for idle-interval
+                // detection (this set becomes the next `prev`). Split into the two
+                // reclaim paths: `peers` (BgpViaBmp, carry RIB records) and
+                // `childless_routers` (Bmp parents with no remaining children). A Bmp
+                // parent that still has children is added to `disconnected` only — it
+                // stays a candidate next sweep but is not yet eligible to reclaim.
+                let mut disconnected: HashSet<IngressId> = HashSet::new();
+                let mut peers: HashSet<IngressId> = HashSet::new();
+                let mut childless_routers: HashSet<IngressId> =
+                    HashSet::new();
+                for (id, i) in info {
+                    if i.state
+                        != Some(ingress::register::IngressState::Disconnected)
+                    {
+                        continue;
+                    }
+                    match i.ingress_type {
+                        Some(
+                            ingress::IngressType::BgpViaBmp
+                            | ingress::IngressType::Bgp,
+                        ) => {
+                            disconnected.insert(*id);
+                            // Defer while ADD-PATH path-children still reference
+                            // this session as parent: they are reclaimed this
+                            // sweep, the session becomes eligible on the next one.
+                            if !parents_in_use.contains(id) {
+                                peers.insert(*id);
+                            }
+                        }
+                        Some(ingress::IngressType::BgpPath) => {
+                            // Path-children carry RIB records under their own mui,
+                            // so they flow through the record-reclaiming path.
+                            disconnected.insert(*id);
+                            peers.insert(*id);
+                        }
+                        Some(ingress::IngressType::Bmp) => {
+                            disconnected.insert(*id);
+                            if !parents_in_use.contains(id) {
+                                childless_routers.insert(*id);
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                Some(ingress::IngressType::BgpPath) => {
-                    // Path-children carry RIB records under their own mui,
-                    // so they flow through the record-reclaiming path.
-                    disconnected.insert(*id);
-                    peers.insert(*id);
-                }
-                Some(ingress::IngressType::Bmp) => {
-                    disconnected.insert(*id);
-                    if !parents_in_use.contains(id) {
-                        childless_routers.insert(*id);
-                    }
-                }
-                _ => {}
-            }
-        }
+
+                (disconnected, peers, childless_routers)
+            });
 
         // Reclaim BgpViaBmp peers that were already Disconnected last sweep.
         let peers_to_reclaim: Vec<IngressId> =
@@ -2016,12 +2074,15 @@ impl Rib {
             // FIRST, and only physically reclaim the store records
             // (remove_mui) for ids that were actually removed. A peer that
             // reconnected and rebound its id in the window since the
-            // cloned_info() snapshot is now Connected: remove_if_disconnected
+            // borrowed census is now Connected: remove_if_disconnected
             // returns None for it, so we neither delete its live registration
             // nor wipe its freshly inserted routes. Removing from the register
             // before remove_mui also means any concurrent reuse can no longer
             // match this id (it mints a fresh one instead), so remove_mui only
             // ever clears the old, genuinely-departed session's records.
+            // Pending path payloads hold a reservation through insertion and
+            // record accounting: remove_if_disconnected also rejects those
+            // children even if an earlier withdrawal has retired them empty.
             let reclaimed: Vec<IngressId> = peers_to_reclaim
                 .iter()
                 .copied()
@@ -2204,13 +2265,14 @@ impl Rib {
             let mut batch: Vec<PrefixRecord<RotondaPaMap>> =
                 Vec::with_capacity(chunk.len());
             for &prefix in chunk {
-                // include_withdrawn=true mirrors the legacy get_value(true);
-                // the retain below then drops Withdrawn (incl. globally
-                // withdrawn muis), keeping Active + InActive exactly as before.
-                if let Ok(Some(mut meta)) =
-                    store.get_records_for_prefix(&prefix, None, true)
-                {
-                    meta.retain(|r| r.status != RouteStatus::Withdrawn);
+                // Rewrite global withdrawals before filtering, but borrow
+                // rejected records and clone each surviving record only once.
+                if let Ok(Some(meta)) = store.get_records_for_prefix_filtered(
+                    &prefix,
+                    None,
+                    true,
+                    &mut |_, status, _| status != RouteStatus::Withdrawn,
+                ) {
                     if !meta.is_empty() {
                         batch.push(PrefixRecord::new(prefix, meta));
                     }
@@ -2268,13 +2330,14 @@ impl Rib {
             let mut batch: Vec<PrefixRecord<FlowSpecRuleSet>> =
                 Vec::with_capacity(chunk.len());
             for &prefix in chunk {
-                if let Ok(Some(mut meta)) =
-                    store.get_records_for_prefix(&prefix, None, true)
-                {
-                    meta.retain(|r| {
-                        r.status != RouteStatus::Withdrawn
-                            && !r.meta.is_empty()
-                    });
+                if let Ok(Some(meta)) = store.get_records_for_prefix_filtered(
+                    &prefix,
+                    None,
+                    true,
+                    &mut |_, status, meta| {
+                        status != RouteStatus::Withdrawn && !meta.is_empty()
+                    },
+                ) {
                     if !meta.is_empty() {
                         batch.push(PrefixRecord::new(prefix, meta));
                     }
@@ -2540,7 +2603,14 @@ impl Rib {
 
         let t0 = std::time::Instant::now();
         let mut res = store
-            .match_prefix(&nlri, match_options, guard)
+            .match_prefix_filtered(
+                &nlri,
+                match_options,
+                guard,
+                &mut |id, _, meta| {
+                    self.record_matches_filter(id, meta, &filter)
+                },
+            )
             .map(|res| {
                 SearchResult::new(
                     res,
@@ -2664,6 +2734,59 @@ impl Rib {
     // In such case, we could optimize:
     //  - fetch the required info once, pass it into apply_filter
     //  - in apply_filter, check for such info and branch: if let Some(passed_info), etc
+
+    // Called under one prefix's record lock. Borrow ingress metadata for this
+    // comparison only; no display strings, capabilities or route records copied.
+    fn record_matches_filter(
+        &self,
+        id: IngressId,
+        meta: &RotondaPaMap,
+        filter: &QueryFilter,
+    ) -> bool {
+        if filter.roto_function.is_some() {
+            return true;
+        }
+        if filter.ingress_id.is_none()
+            && filter.ingress_type.is_none()
+            && filter.rib_type.is_none()
+            && filter.peer_asn.is_none()
+            && filter.peer_addr.is_none()
+            && filter.rov_status.is_none()
+            && filter.otc.is_none()
+            && filter.community.is_none()
+            && filter.large_community.is_none()
+            && filter.origin_asn.is_none()
+        {
+            return true;
+        }
+        self.ingress_register.with_info(|all| {
+            let info = all.get(&id);
+            if filter.ingress_id.is_some_and(|want| want != id) { return false; }
+            if filter.ingress_type.is_some_and(|want| !info
+                .is_some_and(|ii| ingress_type_matches(want, ii, all))) { return false; }
+            if filter.rib_type.is_some_and(|want| info
+                .is_some_and(|ii| !rib_type_matches(want, ii, all))) { return false; }
+            if filter.peer_asn.is_some_and(|want| info
+                .is_some_and(|ii| ii.remote_asn != Some(want))) { return false; }
+            if filter.peer_addr.is_some_and(|want| info
+                .is_some_and(|ii| ii.remote_addr != Some(want))) { return false; }
+            if filter.rov_status.is_some_and(|want| meta.rpki_info().rov_status() != want) { return false; }
+            if filter.otc.is_none() && filter.community.is_none()
+                && filter.large_community.is_none() && filter.origin_asn.is_none()
+            { return true; }
+            let attrs = meta.path_attributes();
+            if filter.otc.is_some_and(|want| attrs.get::<Otc>().map(|v| v.0) != Some(want)) { return false; }
+            if filter.community.is_some_and(|want| !attrs
+                .get::<routecore::bgp::message::update_builder::StandardCommunitiesList>()
+                .is_some_and(|v| v.communities().contains(&want))) { return false; }
+            if filter.large_community.is_some_and(|want| !attrs
+                .get::<routecore::bgp::path_attributes::LargeCommunitiesList>()
+                .is_some_and(|v| v.communities().contains(&want))) { return false; }
+            if filter.origin_asn.is_some_and(|want| route_origin_asn(
+                attrs.get::<HopPath>(), info.map(|ii| session_info(ii, all))) != Some(want)) { return false; }
+            true
+        })
+    }
 
     fn apply_filter(
         &self,
@@ -2861,10 +2984,9 @@ impl Rib {
         filter: QueryFilter,
         target: &mut W,
     ) -> Result<(), crate::representation::OutputError> {
-        // Full-RIB dumps hold an epoch guard across the whole walk, which
-        // pins concurrent withdraw/insert garbage in the store until the
-        // walk completes. Log entry+exit so heavy dumps are attributable
-        // when RSS spikes correlate with HTTP activity.
+        // Log entry and exit to attribute heavy HTTP walks. Borrowed filtering
+        // uses short-lived per-prefix guards; owned batches leave every lock
+        // and guard behind before network-paced serialization.
         let dump_start = std::time::Instant::now();
         let ingress_filter = filter.ingress_id;
         let has_roto = filter.roto_function.is_some();
@@ -2891,8 +3013,8 @@ impl Rib {
             Ok(_) => "ok",
             Err(_) => "err",
         };
-        // Warn on dumps that hold the epoch guard long enough to matter
-        // for reclamation latency; info otherwise.
+        // Slow dumps remain useful diagnostics even though they no longer
+        // pin a guard across network I/O.
         let log_msg = format!(
             "rib dump end: afisafi={afisafi} outcome={outcome} \
              elapsed_ms={} prefixes_scanned={prefixes_scanned} \
@@ -2943,17 +3065,6 @@ impl Rib {
             }
         };
 
-        // An ingressId-scoped dump only ever emits records of that one mui,
-        // so it needs that entry and its parent rather than the whole
-        // register (see `Register::cloned_info_for`). Every other dump can
-        // hold any mui and needs the full snapshot.
-        let ingress_info = match filter.ingress_id {
-            Some(mui) => {
-                self.ingress_register.cloned_info_for(&HashSet::from([mui]))
-            }
-            None => self.ingress_register.cloned_info(),
-        };
-
         let maybe_roto_function: Option<RotoHttpFilter> =
             match filter.roto_function.as_ref() {
                 Some(name) => {
@@ -2993,9 +3104,8 @@ impl Rib {
 
         for chunk in keys.chunks(DUMP_KEY_CHUNK) {
             // Materialise this chunk's records under short-lived per-prefix
-            // guards (get_records_for_prefix pins its own guard). Fetch with
-            // include_withdrawn=true to match the legacy get_value(true) input;
-            // the emit loop applies the same retain(!Withdrawn) as before.
+            // guards. Rewrite global withdrawals as in get_value(true), then
+            // reject borrowed records before cloning each accepted record once.
             let mut batch: Vec<PrefixRecord<RotondaPaMap>> =
                 Vec::with_capacity(chunk.len());
             for &prefix in chunk {
@@ -3007,10 +3117,14 @@ impl Rib {
                 // full more-specifics walk from the family default route), so
                 // an ingressId dump can only be made cheaper per prefix, not
                 // shorter.
-                match store.get_records_for_prefix(
+                match store.get_records_for_prefix_filtered(
                     &prefix,
                     filter.ingress_id,
                     true,
+                    &mut |id, status, meta| {
+                        status != RouteStatus::Withdrawn
+                            && self.record_matches_filter(id, meta, &filter)
+                    },
                 ) {
                     Ok(Some(meta)) => {
                         batch.push(PrefixRecord::new(prefix, meta))
@@ -3034,6 +3148,10 @@ impl Rib {
                 if pr.meta.is_empty() {
                     continue;
                 }
+
+                let ids = pr.meta.iter().map(|r| r.multi_uniq_id).collect();
+                let ingress_info =
+                    self.ingress_register.cloned_info_for(&ids);
 
                 // 2. Apply standard filters in place
                 self.apply_filter(
@@ -3788,7 +3906,11 @@ mod tests {
         hp
     }
 
-    fn session(remote: u32, local: Option<u32>, rib_type: Option<RibType>) -> IngressInfo {
+    fn session(
+        remote: u32,
+        local: Option<u32>,
+        rib_type: Option<RibType>,
+    ) -> IngressInfo {
         IngressInfo {
             remote_asn: Some(Asn::from_u32(remote)),
             local_asn: local.map(Asn::from_u32),
@@ -3801,7 +3923,10 @@ mod tests {
     fn origin_asn_of_a_non_empty_path_is_its_last_as() {
         let ebgp = session(174, Some(64500), None);
         assert_eq!(
-            route_origin_asn(Some(hop_path(&[174, 3356, 15169])), Some(&ebgp)),
+            route_origin_asn(
+                Some(hop_path(&[174, 3356, 15169])),
+                Some(&ebgp)
+            ),
             Some(Asn::from_u32(15169))
         );
     }
@@ -3810,12 +3935,21 @@ mod tests {
     fn origin_asn_of_an_empty_path_is_the_internal_senders_as() {
         // iBGP: the route was originated inside our own AS.
         let ibgp = session(64500, Some(64500), None);
-        assert_eq!(route_origin_asn(Some(hop_path(&[])), Some(&ibgp)), Some(Asn::from_u32(64500)));
-        assert_eq!(route_origin_asn(None, Some(&ibgp)), Some(Asn::from_u32(64500)));
+        assert_eq!(
+            route_origin_asn(Some(hop_path(&[])), Some(&ibgp)),
+            Some(Asn::from_u32(64500))
+        );
+        assert_eq!(
+            route_origin_asn(None, Some(&ibgp)),
+            Some(Asn::from_u32(64500))
+        );
 
         // A BMP Loc-RIB view: the peer AS is the monitored router's own.
         let loc_rib = session(64500, None, Some(RibType::LocRib));
-        assert_eq!(route_origin_asn(Some(hop_path(&[])), Some(&loc_rib)), Some(Asn::from_u32(64500)));
+        assert_eq!(
+            route_origin_asn(Some(hop_path(&[])), Some(&loc_rib)),
+            Some(Asn::from_u32(64500))
+        );
     }
 
     #[test]
@@ -3824,7 +3958,10 @@ mod tests {
         assert_eq!(route_origin_asn(Some(hop_path(&[])), Some(&ebgp)), None);
         // A BMP Adj-RIB-In view without a known local AS claims nothing either.
         let adj_rib_in = session(174, None, Some(RibType::AdjRibIn));
-        assert_eq!(route_origin_asn(Some(hop_path(&[])), Some(&adj_rib_in)), None);
+        assert_eq!(
+            route_origin_asn(Some(hop_path(&[])), Some(&adj_rib_in)),
+            None
+        );
         // An ingress the register does not know claims nothing.
         assert_eq!(route_origin_asn(Some(hop_path(&[])), None), None);
     }
@@ -3835,7 +3972,10 @@ mod tests {
         let child = info(IngressType::BgpPath, Some(1));
         let all = HashMap::from([(1, parent), (2, child.clone())]);
         assert_eq!(
-            route_origin_asn(Some(hop_path(&[])), Some(session_info(&child, &all))),
+            route_origin_asn(
+                Some(hop_path(&[])),
+                Some(session_info(&child, &all))
+            ),
             Some(Asn::from_u32(64500))
         );
     }
@@ -4280,6 +4420,392 @@ mod tests {
     */
 
     // ------------ FlowSpec store ------------------------------------------
+
+    #[test]
+    fn borrowed_walks_preserve_bytes_for_families_statuses_and_path_sources()
+    {
+        let rib = test_rib();
+        let store = rib.store().unwrap();
+        let parent = rib.ingress_register.register();
+        let child = rib.ingress_register.register();
+        let quitter = rib.ingress_register.register();
+        let unknown = rib.ingress_register.register();
+        rib.ingress_register.update_info(
+            parent,
+            IngressInfo::new()
+                .with_ingress_type(IngressType::BgpViaBmp)
+                .with_local_asn(Asn::from_u32(64500))
+                .with_remote_asn(Asn::from_u32(64500))
+                .with_remote_addr("192.0.2.1".parse::<IpAddr>().unwrap())
+                .with_peer_rib_type(PeerRibType::Loc),
+        );
+        rib.ingress_register.update_info(
+            child,
+            IngressInfo::new()
+                .with_ingress_type(IngressType::BgpPath)
+                .with_parent_ingress(parent)
+                .with_path_id(7u32),
+        );
+        let keys: Vec<Prefix> = [
+            "0.0.0.0/0",
+            "10.0.0.0/8",
+            "10.1.0.0/16",
+            "::/0",
+            "2001:db8::/32",
+            "2001:db8:1::/48",
+        ]
+        .into_iter()
+        .map(|p| p.parse().unwrap())
+        .collect();
+        for &key in &keys {
+            for id in [parent, child, quitter, unknown] {
+                for (n, status) in [
+                    RouteStatus::Active,
+                    RouteStatus::InActive,
+                    RouteStatus::Withdrawn,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    // Distinct MUIs retain each status simultaneously.
+                    store
+                        .insert(
+                            &key,
+                            Record::new(
+                                id + 100 * n as u32,
+                                42,
+                                status,
+                                RotondaPaMap::empty_path_attributes(),
+                            ),
+                            None,
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        store.mark_mui_as_withdrawn(quitter).unwrap();
+        let mut filters = vec![QueryFilter::default()];
+        for id in [parent, child, quitter, unknown, u32::MAX] {
+            filters.push(QueryFilter {
+                ingress_id: Some(id),
+                ..Default::default()
+            });
+        }
+        for kind in [
+            IngressType::Bgp,
+            IngressType::Bmp,
+            IngressType::BgpViaBmp,
+            IngressType::BgpPath,
+        ] {
+            filters.push(QueryFilter {
+                ingress_type: Some(kind),
+                ..Default::default()
+            });
+        }
+        filters.extend([
+            QueryFilter {
+                origin_asn: Some(Asn::from_u32(64500)),
+                ..Default::default()
+            },
+            QueryFilter {
+                origin_asn: Some(Asn::from_u32(1)),
+                ..Default::default()
+            },
+            QueryFilter {
+                rib_type: Some(PeerRibType::Loc),
+                ..Default::default()
+            },
+            QueryFilter {
+                peer_asn: Some(Asn::from_u32(64500)),
+                ..Default::default()
+            },
+            QueryFilter {
+                peer_addr: Some("192.0.2.1".parse().unwrap()),
+                ..Default::default()
+            },
+            QueryFilter {
+                otc: Some(Asn::from_u32(64500)),
+                ..Default::default()
+            },
+            QueryFilter {
+                fields_path_attributes: Some(vec![1, 2]),
+                ..Default::default()
+            },
+        ]);
+        for filter in filters {
+            for (family, prefix, exact) in [
+                (AfiSafiType::Ipv4Unicast, keys[0], keys[1]),
+                (AfiSafiType::Ipv6Unicast, keys[3], keys[4]),
+            ] {
+                let mut legacy_stream = Vec::new();
+                for key in keys.iter().filter(|p| p.is_v4() == prefix.is_v4())
+                {
+                    let records = store
+                        .get_records_for_prefix(key, filter.ingress_id, true)
+                        .unwrap()
+                        .unwrap_or_default();
+                    let mut result = SearchResult::new(QueryResult {
+                        prefix: Some(*key), records,
+                        match_type: rotonda_store::match_options::MatchType::ExactMatch,
+                        more_specifics: None, less_specifics: None,
+                    }, rib.ingress_register.clone(), filter.clone());
+                    result
+                        .query_result
+                        .records
+                        .retain(|r| r.status != RouteStatus::Withdrawn);
+                    rib.apply_filter(
+                        &mut result.query_result.records,
+                        &filter,
+                        None,
+                        &result.ingress_info,
+                    );
+                    for record in &result.query_result.records {
+                        assert!(result
+                            .write_jsonl_line(
+                                &mut legacy_stream,
+                                *key,
+                                record,
+                                if *key == prefix {
+                                    "data"
+                                } else {
+                                    "moreSpecifics"
+                                }
+                            )
+                            .is_ok());
+                    }
+                }
+                let mut streamed = Vec::new();
+                assert!(rib
+                    .write_jsonl_stream(
+                        family,
+                        prefix,
+                        filter.clone(),
+                        &mut streamed
+                    )
+                    .is_ok());
+                assert_eq!(
+                    streamed, legacy_stream,
+                    "stream {family} {filter:?}"
+                );
+
+                let guard = &epoch::pin();
+                let options = MatchOptions {
+                    match_type:
+                        rotonda_store::match_options::MatchType::ExactMatch,
+                    include_more_specifics: true,
+                    include_less_specifics: true,
+                    include_withdrawn: false,
+                    mui: filter.ingress_id,
+                    include_history:
+                        rotonda_store::match_options::IncludeHistory::None,
+                };
+                let mut query_filter = filter.clone();
+                query_filter.include =
+                    vec![Include::MoreSpecifics, Include::LessSpecifics];
+                let mut legacy = SearchResult::new(
+                    store.match_prefix(&exact, &options, guard).unwrap(),
+                    rib.ingress_register.clone(),
+                    query_filter.clone(),
+                );
+                rib.apply_filter(
+                    &mut legacy.query_result.records,
+                    &query_filter,
+                    None,
+                    &legacy.ingress_info,
+                );
+                for set in [
+                    legacy.query_result.more_specifics.as_mut(),
+                    legacy.query_result.less_specifics.as_mut(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    for family in [&mut set.v4, &mut set.v6] {
+                        family.retain_mut(|pr| {
+                            rib.apply_filter(
+                                &mut pr.meta,
+                                &query_filter,
+                                None,
+                                &legacy.ingress_info,
+                            );
+                            !pr.meta.is_empty()
+                        });
+                    }
+                }
+                let actual =
+                    rib.search_routes(family, exact, query_filter).unwrap();
+                assert_eq!(
+                    serde_json::to_vec(&actual).unwrap(),
+                    serde_json::to_vec(&legacy).unwrap(),
+                    "query {family} {filter:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn memory_gc_borrows_register_instead_of_cloning() {
+        use crate::tests::allocations::measure;
+        let rib = test_rib();
+        for _ in 0..4096 {
+            let id = rib.ingress_register.register();
+            rib.ingress_register.update_info(
+                id,
+                IngressInfo::new()
+                    .with_name("x".repeat(2048))
+                    .with_ingress_type(IngressType::Bgp)
+                    .with_state(
+                        ingress::register::IngressState::Disconnected,
+                    ),
+            );
+        }
+        let (snapshot, before) =
+            measure(|| rib.ingress_register.cloned_info());
+        assert_eq!(before.ingress_clones, 4096);
+        drop(snapshot);
+        let (candidates, after) =
+            measure(|| rib.gc_disconnected_bmp_peers(HashSet::new()));
+        assert_eq!(candidates.len(), 4096);
+        assert_eq!(after.ingress_clones, 0);
+        assert!(after.peak_bytes < before.peak_bytes / 10);
+        eprintln!(
+            "GC 4096 ingresses: clones {} -> {}; peak {} -> {} bytes",
+            before.ingress_clones,
+            after.ingress_clones,
+            before.peak_bytes,
+            after.peak_bytes
+        );
+    }
+
+    #[test]
+    fn memory_origin_walk_filters_borrowed_records_and_preserves_bytes() {
+        use crate::{
+            representation::OutputFormat, tests::allocations::measure,
+        };
+        let rib = test_rib();
+        let store = rib.store().unwrap();
+        for peer in 0..16 {
+            let id = rib.ingress_register.register();
+            let asn = Asn::from_u32(64500 + peer);
+            rib.ingress_register.update_info(
+                id,
+                IngressInfo::new()
+                    .with_ingress_type(IngressType::Bgp)
+                    .with_local_asn(asn)
+                    .with_remote_asn(asn),
+            );
+            for n in 0..256 {
+                store
+                    .insert(
+                        &format!("10.0.{n}.0/24").parse().unwrap(),
+                        Record::new(
+                            id,
+                            0,
+                            RouteStatus::Active,
+                            RotondaPaMap::empty_path_attributes(),
+                        ),
+                        None,
+                    )
+                    .unwrap();
+            }
+        }
+        let prefix = "0.0.0.0/0".parse().unwrap();
+        let filter = QueryFilter {
+            origin_asn: Some(Asn::from_u32(64500)),
+            include: vec![Include::MoreSpecifics],
+            ..Default::default()
+        };
+        // Reproduce the old clone-everything-then-filter path on the SAME map,
+        // so HashMap iteration and resulting HTTP bytes can be compared exactly.
+        let (mut legacy, before) = measure(|| {
+            let guard = &epoch::pin();
+            let result = store.match_prefix(&prefix, &MatchOptions {
+                match_type: rotonda_store::match_options::MatchType::ExactMatch,
+                include_more_specifics: true, include_less_specifics: false,
+                include_withdrawn: false, mui: None,
+                include_history: rotonda_store::match_options::IncludeHistory::None,
+            }, guard).unwrap();
+            SearchResult::new(
+                result,
+                rib.ingress_register.clone(),
+                filter.clone(),
+            )
+        });
+        let all = &legacy.ingress_info;
+        rib.apply_filter(
+            &mut legacy.query_result.records,
+            &filter,
+            None,
+            all,
+        );
+        for set in [
+            legacy.query_result.more_specifics.as_mut(),
+            legacy.query_result.less_specifics.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for family in [&mut set.v4, &mut set.v6] {
+                family.retain_mut(|pr| {
+                    rib.apply_filter(&mut pr.meta, &filter, None, all);
+                    !pr.meta.is_empty()
+                });
+            }
+        }
+        let (result, after) = measure(|| {
+            rib.search_routes(
+                AfiSafiType::Ipv4Unicast,
+                prefix,
+                filter.clone(),
+            )
+            .unwrap()
+        });
+        assert_eq!(
+            serde_json::to_vec(&result).unwrap(),
+            serde_json::to_vec(&legacy).unwrap()
+        );
+        assert_eq!(before.route_clones, 4096);
+        assert_eq!(after.route_clones, 256);
+        eprintln!("origin walk 4096 records / 256 matches: clones {} -> {}; peak {} -> {} bytes",
+            before.route_clones, after.route_clones, before.peak_bytes, after.peak_bytes);
+        let (_, old_stream) = measure(|| {
+            for prefix in store.prefixes_keys_iter_v4() {
+                let _ = store
+                    .get_records_for_prefix(&prefix, None, true)
+                    .unwrap();
+            }
+        });
+        assert_eq!(old_stream.route_clones, 8192);
+        let (_, full_stream) =
+            measure(|| rib.stream_prefix_records(|_| true).unwrap());
+        assert_eq!(full_stream.route_clones, 4096);
+        eprintln!(
+            "unfiltered stream 4096 records: clones {} -> {}",
+            old_stream.route_clones, full_stream.route_clones
+        );
+        let (_, census) = measure(|| rib.store_status_split(store));
+        assert_eq!(census.route_clones, 0);
+        let mut expected = Vec::new();
+        legacy.write_jsonl(&mut expected).map_err(|_| ()).unwrap();
+        let ((), streamed) = measure(|| {
+            let mut actual = Vec::new();
+            rib.write_jsonl_stream(
+                AfiSafiType::Ipv4Unicast,
+                prefix,
+                QueryFilter {
+                    format: OutputFormat::Jsonl,
+                    ..filter
+                },
+                &mut actual,
+            )
+            .map_err(|_| ())
+            .unwrap();
+            assert_eq!(actual, expected);
+        });
+        assert_eq!(streamed.route_clones, 256);
+        eprintln!("streamed origin walk: clones {} -> {}; diagnostic census clones={}",
+            old_stream.route_clones, streamed.route_clones, census.route_clones);
+    }
 
     fn test_rib() -> Rib {
         Rib::new(Default::default(), None, Arc::new(Mutex::new(Ctx::empty())))
@@ -5063,6 +5589,94 @@ mod tests {
     fn gc_twice(rib: &Rib) {
         let prev = rib.gc_disconnected_bmp_peers(HashSet::new());
         rib.gc_disconnected_bmp_peers(prev);
+    }
+
+    #[test]
+    fn status_split_counts_status_and_missing_registrations() {
+        let rib = test_rib();
+        let registered = SessionSide::new(&rib.ingress_register).session;
+        let withdrawn_session =
+            SessionSide::new(&rib.ingress_register).session;
+        let orphan = rib.ingress_register.register();
+        for (prefix, status, mui) in [
+            ("192.0.2.0/24", RouteStatus::Active, registered),
+            ("198.51.100.0/24", RouteStatus::Withdrawn, registered),
+            ("203.0.113.0/24", RouteStatus::InActive, registered),
+            ("10.0.0.0/8", RouteStatus::Active, withdrawn_session),
+            ("192.0.2.0/24", RouteStatus::Active, orphan),
+            ("203.0.113.0/24", RouteStatus::Withdrawn, orphan),
+        ] {
+            rib.store()
+                .unwrap()
+                .insert(
+                    &prefix.parse().unwrap(),
+                    Record::new(
+                        mui,
+                        0,
+                        status,
+                        RotondaPaMap::empty_path_attributes(),
+                    ),
+                    None,
+                )
+                .unwrap();
+        }
+        rib.store()
+            .unwrap()
+            .mark_mui_as_withdrawn(withdrawn_session)
+            .unwrap();
+        let split = rib.store_status_split(rib.store().unwrap());
+        assert_eq!(
+            split.counts,
+            RouteStatusCounts {
+                active: 2,
+                inactive: 1,
+                withdrawn: 3,
+            }
+        );
+        assert_eq!(split.counts.total(), rib.store_counts()[0].routes);
+        assert_eq!(split.orphan_records, 2);
+        assert_eq!(split.orphan_muis, 1);
+        assert_eq!(
+            split.per_mui[&registered],
+            RouteStatusCounts {
+                active: 1,
+                inactive: 1,
+                withdrawn: 1,
+            }
+        );
+        rib.report_memory(true);
+    }
+
+    #[test]
+    fn ordinary_withdrawals_do_not_accumulate_records() {
+        let rib = test_rib();
+        let anchor = SessionSide::new(&rib.ingress_register).session;
+        let peer = SessionSide::new(&rib.ingress_register).session;
+        let prefixes = ["192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"];
+        for p in prefixes {
+            insert_v4(&rib, p, RouteStatus::Active, anchor);
+        }
+        for p in prefixes {
+            insert_v4(&rib, p, RouteStatus::Active, peer);
+            insert_v4(&rib, p, RouteStatus::Withdrawn, peer);
+            gc_twice(&rib);
+            assert_eq!(stored_records(&rib).len(), prefixes.len());
+            assert_eq!(live_records(&rib).len(), prefixes.len());
+        }
+        // Repeated and never-announced withdrawals report no removal.
+        for p in [prefixes[0], "10.0.0.0/8"] {
+            let report = rib
+                .insert(
+                    &v4_route(p),
+                    RouteStatus::Withdrawn,
+                    0,
+                    peer,
+                    false,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(report.mui_count, 0);
+        }
     }
 
     #[derive(Clone, Copy)]

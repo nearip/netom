@@ -172,44 +172,50 @@ fn native_bgp_neighbors() -> Vec<Neighbor> {
 
 /// Peers observed through BMP feeds, from the ingress register.
 fn bmp_neighbors(state: &ApiState) -> Vec<Neighbor> {
-    let all = state.ingress_register.cloned_info();
+    state.ingress_register.with_info(|all| {
+        all.iter()
+            .filter(|(_, info)| {
+                info.ingress_type == Some(IngressType::BgpViaBmp)
+            })
+            .map(|(id, info)| {
+                // The monitored router this session was seen through.
+                let via =
+                    info.parent_ingress.and_then(|parent| all.get(&parent));
 
-    all.iter()
-        .filter(|(_, info)| info.ingress_type == Some(IngressType::BgpViaBmp))
-        .map(|(id, info)| {
-            // The monitored router this session was seen through.
-            let via = info
-                .parent_ingress
-                .and_then(|parent| state.ingress_register.get(parent));
+                let up = info.state == Some(IngressState::Connected);
 
-            let up = info.state == Some(IngressState::Connected);
-
-            Neighbor {
-                peer_address: info.remote_addr,
-                peer_asn: info.remote_asn.map(|a| a.into_u32()),
-                source: Some(PeerSource::Bmp),
-                // A BMP feed tells us a peer is up or down; the monitored
-                // router's own FSM is not visible to us.
-                state: Some(if up { "Established" } else { "Idle" }),
-                configured: false,
-                router_id: info.bgp_id.map(|id| {
-                    format!("{}.{}.{}.{}", id[0], id[1], id[2], id[3])
-                }),
-                ingress_id: Some(*id),
-                // `session_up_time` records when the session came up and
-                // is not cleared on peer-down, so reporting it for a
-                // disconnected peer would show a still-climbing uptime for
-                // a session that is gone.
-                up_seconds: info.session_up_time.filter(|_| up).map(|up| {
-                    (chrono::Utc::now() - up).num_seconds().max(0) as u64
-                }),
-                via_router: via.as_ref().and_then(|v| v.remote_addr),
-                via_ingress_id: info.parent_ingress,
-                peer_rib_type: info.peer_rib_type.map(|t| format!("{t:?}")),
-                ..Default::default()
-            }
-        })
-        .collect()
+                Neighbor {
+                    peer_address: info.remote_addr,
+                    peer_asn: info.remote_asn.map(|a| a.into_u32()),
+                    source: Some(PeerSource::Bmp),
+                    // A BMP feed tells us a peer is up or down; the monitored
+                    // router's own FSM is not visible to us.
+                    state: Some(if up { "Established" } else { "Idle" }),
+                    configured: false,
+                    router_id: info.bgp_id.map(|id| {
+                        format!("{}.{}.{}.{}", id[0], id[1], id[2], id[3])
+                    }),
+                    ingress_id: Some(*id),
+                    // `session_up_time` records when the session came up and
+                    // is not cleared on peer-down, so reporting it for a
+                    // disconnected peer would show a still-climbing uptime for
+                    // a session that is gone.
+                    up_seconds: info.session_up_time.filter(|_| up).map(
+                        |up| {
+                            (chrono::Utc::now() - up).num_seconds().max(0)
+                                as u64
+                        },
+                    ),
+                    via_router: via.as_ref().and_then(|v| v.remote_addr),
+                    via_ingress_id: info.parent_ingress,
+                    peer_rib_type: info
+                        .peer_rib_type
+                        .map(|t| format!("{t:?}")),
+                    ..Default::default()
+                }
+            })
+            .collect()
+    })
 }
 
 async fn neighbors(

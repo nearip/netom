@@ -264,3 +264,134 @@ impl axum::response::IntoResponse for ApiError {
             .into_response()
     }
 }
+
+const STREAM_CHUNK_SIZE: usize = 256 * 1024;
+
+/// How long a streaming response may block on a single channel send — i.e. a
+/// client that has stopped reading, leaving the bounded response channel full
+/// — before the dump is aborted. Without this bound a connected-but-stalled
+/// client pins the blocking dump thread (and, for full-table dumps, its
+/// [`crate::units::rib_unit::rib::DumpGuard`] slot) indefinitely.
+const STREAM_WRITE_STALL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+pub(crate) struct StreamResponseWriter {
+    sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    buffer: Vec<u8>,
+    handle: tokio::runtime::Handle,
+}
+
+impl StreamResponseWriter {
+    pub(crate) fn new(
+        sender: tokio::sync::mpsc::Sender<
+            Result<bytes::Bytes, std::io::Error>,
+        >,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            sender,
+            buffer: Vec::with_capacity(STREAM_CHUNK_SIZE),
+            handle,
+        }
+    }
+
+    fn send_buffer(&mut self) -> std::io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let chunk = bytes::Bytes::copy_from_slice(&self.buffer);
+        self.buffer.clear();
+        // Bounded send (runs on a spawn_blocking thread, so block_on is legal):
+        // abort the dump if the client stops draining for STREAM_WRITE_STALL
+        // (channel stays full). A closed channel — client disconnected — still
+        // maps to BrokenPipe exactly as the previous blocking_send did.
+        self.handle
+            .block_on(self.sender.send_timeout(Ok(chunk), STREAM_WRITE_STALL))
+            .map_err(|e| match e {
+                tokio::sync::mpsc::error::SendTimeoutError::Timeout(_) => {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "client stalled draining response",
+                    )
+                }
+                tokio::sync::mpsc::error::SendTimeoutError::Closed(_) => {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "receiver dropped",
+                    )
+                }
+            })
+    }
+}
+
+impl std::io::Write for StreamResponseWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut remaining = buf;
+        while !remaining.is_empty() {
+            let n =
+                remaining.len().min(STREAM_CHUNK_SIZE - self.buffer.len());
+            self.buffer.extend_from_slice(&remaining[..n]);
+            remaining = &remaining[n..];
+            if self.buffer.len() == STREAM_CHUNK_SIZE {
+                self.send_buffer()?;
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.send_buffer()
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn response_writer_bounds_chunks_and_stops_on_disconnect() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let handle = tokio::runtime::Handle::current();
+        let producer = tokio::task::spawn_blocking(move || {
+            let mut writer = StreamResponseWriter::new(tx, handle);
+            writer
+                .write_all(&vec![b'x'; STREAM_CHUNK_SIZE * 5 + 17])
+                .unwrap();
+            writer.flush().unwrap();
+        });
+        let mut sizes = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            let chunk = chunk.unwrap();
+            assert!(chunk.len() <= STREAM_CHUNK_SIZE);
+            assert!(chunk.iter().all(|&b| b == b'x'));
+            sizes.push(chunk.len());
+        }
+        producer.await.unwrap();
+        assert_eq!(
+            sizes,
+            [
+                STREAM_CHUNK_SIZE,
+                STREAM_CHUNK_SIZE,
+                STREAM_CHUNK_SIZE,
+                STREAM_CHUNK_SIZE,
+                STREAM_CHUNK_SIZE,
+                17
+            ]
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        drop(rx);
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let mut writer = StreamResponseWriter::new(tx, handle);
+            writer.write_all(b"a").unwrap();
+            assert_eq!(
+                writer.flush().unwrap_err().kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+        })
+        .await
+        .unwrap();
+    }
+}

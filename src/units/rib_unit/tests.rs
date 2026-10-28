@@ -1398,8 +1398,14 @@ async fn process_update_withdraw_can_drop_attributes() {
         .await
         .unwrap();
 
-    assert_eq!(stored_status(&runner, &prefix), RouteStatus::Withdrawn);
-    assert_eq!(stored_attr_len(&runner, &prefix), 2);
+    assert!(runner
+        .rib()
+        .store()
+        .unwrap()
+        .get_records_for_prefix(&prefix, Some(1), true)
+        .unwrap()
+        .is_none_or(|records| records.is_empty()));
+    assert_eq!(runner.rib().store_counts()[0].routes, 0);
 }
 
 #[tokio::test]

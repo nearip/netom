@@ -233,12 +233,22 @@ impl AsRef<[u8]> for RotondaPaMap {
     }
 }
 
-#[derive(Debug, Default, Clone, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 pub struct RotondaPaMap {
     // raw[0] is RpkiInfo
     // raw[1] is PduParseInfo
     // raw[2..] contains the path attributes blob
     raw: Arc<[u8]>,
+}
+
+impl Clone for RotondaPaMap {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        crate::tests::allocations::route_clone();
+        Self {
+            raw: self.raw.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -534,14 +544,17 @@ impl From<OwnedPathAttributes> for RotondaPaMap {
     }
 }
 
-#[derive(Clone, Debug, Eq)]
+#[derive(Clone, Debug)]
 pub struct Payload {
     pub rx_value: RotondaRoute, //RouteWorkshop<N>, //was: TypeValue,
     pub trace_id: Option<u8>,
     pub received: std::time::Instant,
     pub ingress_id: IngressId,
     pub route_status: RouteStatus,
+    pub(crate) path_child_use: Option<ingress::register::PathChildUse>,
 }
+
+impl Eq for Payload {}
 
 impl PartialEq for Payload {
     fn eq(&self, other: &Self) -> bool {
@@ -564,6 +577,7 @@ impl Payload {
             received: std::time::Instant::now(),
             ingress_id,
             route_status,
+            path_child_use: None,
         }
     }
 
@@ -580,7 +594,16 @@ impl Payload {
             received,
             ingress_id,
             route_status,
+            path_child_use: None,
         }
+    }
+
+    pub(crate) fn with_path_child_use(
+        mut self,
+        reservation: Option<ingress::register::PathChildUse>,
+    ) -> Self {
+        self.path_child_use = reservation;
+        self
     }
 
     pub fn trace_id(&self) -> Option<u8> {

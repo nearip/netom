@@ -1,3 +1,4 @@
+use crate::http_ng::StreamResponseWriter;
 use std::io::Write;
 use std::{
     fmt::Display,
@@ -188,73 +189,6 @@ impl QueryFilter {
 pub enum Include {
     MoreSpecifics,
     LessSpecifics,
-}
-
-const STREAM_CHUNK_SIZE: usize = 256 * 1024;
-
-/// How long a streaming response may block on a single channel send — i.e. a
-/// client that has stopped reading, leaving the bounded response channel full
-/// — before the dump is aborted. Without this bound a connected-but-stalled
-/// client pins the blocking dump thread (and, for full-table dumps, its
-/// [`super::rib::DumpGuard`] slot) indefinitely.
-const STREAM_WRITE_STALL: std::time::Duration =
-    std::time::Duration::from_secs(60);
-
-struct StreamResponseWriter {
-    sender: mpsc::Sender<Result<Bytes, io::Error>>,
-    buffer: Vec<u8>,
-    handle: tokio::runtime::Handle,
-}
-
-impl StreamResponseWriter {
-    fn new(
-        sender: mpsc::Sender<Result<Bytes, io::Error>>,
-        handle: tokio::runtime::Handle,
-    ) -> Self {
-        Self {
-            sender,
-            buffer: Vec::with_capacity(STREAM_CHUNK_SIZE),
-            handle,
-        }
-    }
-
-    fn send_buffer(&mut self) -> io::Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-        let chunk = Bytes::copy_from_slice(&self.buffer);
-        self.buffer.clear();
-        // Bounded send (runs on a spawn_blocking thread, so block_on is legal):
-        // abort the dump if the client stops draining for STREAM_WRITE_STALL
-        // (channel stays full). A closed channel — client disconnected — still
-        // maps to BrokenPipe exactly as the previous blocking_send did.
-        self.handle
-            .block_on(self.sender.send_timeout(Ok(chunk), STREAM_WRITE_STALL))
-            .map_err(|e| match e {
-                mpsc::error::SendTimeoutError::Timeout(_) => io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "client stalled draining response",
-                ),
-                mpsc::error::SendTimeoutError::Closed(_) => io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "receiver dropped",
-                ),
-            })
-    }
-}
-
-impl io::Write for StreamResponseWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
-        if self.buffer.len() >= STREAM_CHUNK_SIZE {
-            self.send_buffer()?;
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.send_buffer()
-    }
 }
 
 fn stream_search_result(
@@ -453,8 +387,7 @@ fn build_flowspec_response(
     // the unfiltered result: an ingressType query does not make an oversized
     // FlowSpec table fit, it only narrows what is returned.
     let rows = match filter.ingress_type {
-        Some(want) => {
-            let all = rib.ingress_register.cloned_info();
+        Some(want) => rib.ingress_register.with_info(|all| {
             rows.into_iter()
                 .filter(|row| {
                     all.get(&row.ingress_id)
@@ -464,7 +397,7 @@ fn build_flowspec_response(
                         .unwrap_or(false)
                 })
                 .collect()
-        }
+        }),
         None => rows,
     };
 
@@ -889,7 +822,9 @@ async fn run_best_path(
     Ok((
         [("content-type", OutputFormat::Json.content_type())],
         serde_json::to_string(&body).map_err(|e| {
-            ApiError::InternalServerError(format!("serialization failed: {e}"))
+            ApiError::InternalServerError(format!(
+                "serialization failed: {e}"
+            ))
         })?,
     ))
 }

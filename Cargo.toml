@@ -38,7 +38,7 @@ authors = ["NLnet Labs <routing-team@nlnetlabs.nl>", "FastNetMon Inc <support@fa
 [workspace.dependencies]
 routecore          = { git = "https://github.com/FastNetMon/routecore.git", features = ["bgp", "bmp", "serde", "fsm", "mrt"] }
 inetnum            = { git = "https://github.com/FastNetMon/inetnum.git", tag = "v0.1.1-fnm1", features = ["arbitrary", "serde"] }
-rotonda-store      = { git = "https://github.com/nearip/netom-store.git", rev = "21d317b30d5102c9941cbb7cca423f52cc4b8a08" }   # fork of netom-store fnm-gc: batched mui removal (FastNetMon/netom-store PR pending)
+rotonda-store      = { git = "https://github.com/nearip/netom-store.git", rev = "de77e5f7448e873388dc985ad814a00a9c47bea4" }   # fork of netom-store fnm-gc: batched mui removal, filtered queries that borrow before cloning
 log                = "0.4"
 
 
